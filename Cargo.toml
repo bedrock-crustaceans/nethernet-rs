@@ -9,7 +9,7 @@ rust-version = "1.85"
 tokio = { version = "1.52.3", features = ["net", "sync", "time", "rt-multi-thread", "macros"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }
 tracing = "0.1.44"
-bitflags = "2.12.1"
+bitflags = "2.13.0"
 bytes = "1.11.1"
 thiserror = "2.0.17"
 webrtc = "0.17.0"
