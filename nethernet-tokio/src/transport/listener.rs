@@ -1,27 +1,35 @@
 use crate::error::{NethernetError, Result};
-use crate::protocol::webrtc::format_ice_candidate;
-use crate::protocol::{
-    Signal, SignalType,
-    constants::{RELIABLE_CHANNEL, UNRELIABLE_CHANNEL},
-};
+use crate::protocol::constants::{RELIABLE_CHANNEL, SCTP_PORT, UNRELIABLE_CHANNEL};
+use crate::protocol::webrtc::{Description, format_ice_candidate, parse_ice_candidate};
+use crate::protocol::{Signal, SignalType};
 use crate::session::Session;
 use crate::signaling::Signaling;
+use crate::transport::Transports;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
-use tokio::sync::{Mutex, mpsc};
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use webrtc::api::APIBuilder;
-use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::dtls_transport::dtls_role::DTLSRole;
+use webrtc::ice_transport::ice_role::RTCIceRole;
+
+/// Time to wait for the first candidate signaled by the remote connection.
+const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Time to wait for each transport to start.
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Time to wait for the data channels created by the remote connection.
+const CHANNEL_TIMEOUT: Duration = Duration::from_secs(5);
+
+type SignalDispatchers = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Signal>>>>;
 
 /// NetherNet listener - accepts WebRTC connections
 pub struct NethernetListener<S: Signaling> {
@@ -41,7 +49,6 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let signaling = Arc::new(signaling);
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let signal_dispatchers = Arc::new(Mutex::new(HashMap::new()));
-        let candidate_notifiers = Arc::new(Mutex::new(HashMap::new()));
         let cancel_token = CancellationToken::new();
 
         // Start signal handler task
@@ -49,7 +56,6 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             signaling,
             incoming_tx,
             signal_dispatchers,
-            candidate_notifiers.clone(),
             cancel_token.clone(),
         );
 
@@ -67,8 +73,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
     fn start_signal_handler(
         signaling: Arc<S>,
         incoming_tx: mpsc::UnboundedSender<Arc<Session>>,
-        signal_dispatchers: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Signal>>>>,
-        candidate_notifiers: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>>,
+        signal_dispatchers: SignalDispatchers,
         cancel_token: CancellationToken,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
@@ -89,7 +94,6 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                                             &signaling,
                                             &incoming_tx,
                                             &signal_dispatchers,
-                                            &candidate_notifiers,
                                         )
                                         .await
                                         {
@@ -113,229 +117,157 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         })
     }
 
+    /// Answers an offer signaled by a remote connection with the parameters of the local
+    /// transports and establishes them once the remote connection signals its candidates.
     async fn handle_offer(
         signal: Signal,
         signaling: &Arc<S>,
         incoming_tx: &mpsc::UnboundedSender<Arc<Session>>,
-        signal_dispatchers: &Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Signal>>>>,
-        candidate_notifiers: &Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>>,
+        signal_dispatchers: &SignalDispatchers,
     ) -> Result<()> {
-        // Create WebRTC API with custom settings
-        let media_engine = MediaEngine::default();
+        let description = Description::parse(&signal.data)?;
 
-        // Configure SettingEngine to avoid IPv6 link-local binding issues
-        let mut setting_engine = SettingEngine::default();
+        let transports = Transports::new(SettingEngine::default())?;
+        let (candidates, ice_parameters) = transports.gather().await?;
 
-        let (ufrag, pwd) = super::generate_ice_credentials();
-        setting_engine.set_ice_credentials(ufrag.clone(), pwd);
+        let answer = transports
+            .local_description(ice_parameters.clone(), DTLSRole::Unspecified)?
+            .encode()?;
 
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_setting_engine(setting_engine)
-            .build();
-
-        // Create peer connection
-        let config = RTCConfiguration {
-            ..Default::default()
-        };
-
-        let peer_connection = Arc::new(api.new_peer_connection(config).await?);
-
-        // Set up ICE candidate handler
-        let signaling_clone = signaling.clone();
-        let network_id_clone = signal.network_id.clone();
         let connection_id = signal.connection_id;
-        let candidate_index = Arc::new(AtomicUsize::new(0));
-        peer_connection.on_ice_candidate(Box::new(
-            move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
-                let signaling = signaling_clone.clone();
-                let network_id = network_id_clone.clone();
-                let index = candidate_index.clone();
-                let ufrag = ufrag.clone();
-                Box::pin(async move {
-                    if let Some(candidate) = candidate {
-                        let index = index.fetch_add(1, Ordering::Relaxed);
-                        let candidate_signal = Signal::candidate(
-                            connection_id,
-                            format_ice_candidate(index, &candidate, &ufrag),
-                            network_id,
-                        );
-                        let _ = signaling.signal(candidate_signal).await;
-                    }
-                })
-            },
-        ));
+        let network_id = signal.network_id;
 
-        // Create oneshot channel to wait for first ICE candidate BEFORE set_remote_description
-        // This ensures the candidate handler is ready before ICE negotiation starts
-        let (candidate_tx, candidate_rx) = tokio::sync::oneshot::channel();
-        {
-            let mut notifiers = candidate_notifiers.lock().await;
-            notifiers.insert(connection_id, candidate_tx);
-        }
-
-        // Register per-connection signal channel BEFORE set_remote_description
-        // This ensures we can receive remote candidates as soon as they arrive
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
-        {
-            let mut dispatchers = signal_dispatchers.lock().await;
-            dispatchers.insert(connection_id, signal_tx);
+        signal_dispatchers
+            .lock()
+            .await
+            .insert(connection_id, signal_tx);
+
+        signaling
+            .signal(Signal::answer(connection_id, answer, network_id.clone()))
+            .await?;
+        for (index, candidate) in candidates.iter().enumerate() {
+            signaling
+                .signal(Signal::candidate(
+                    connection_id,
+                    format_ice_candidate(index, candidate, &ice_parameters.username_fragment),
+                    network_id.clone(),
+                ))
+                .await?;
         }
 
-        // Handle incoming ICE candidates for this connection
-        // This must be set up BEFORE set_remote_description to receive candidates immediately
-        let peer_connection_clone = peer_connection.clone();
-        let signal_dispatchers_clone = signal_dispatchers.clone();
-        let candidate_notifiers_clone = candidate_notifiers.clone();
+        let (candidate_tx, candidate_rx) = oneshot::channel();
+        let ice = transports.ice.clone();
+        let dispatchers = signal_dispatchers.clone();
         tokio::spawn(async move {
-            let mut first_candidate = true;
-            while let Some(sig) = signal_rx.recv().await {
-                if sig.signal_type == SignalType::Candidate {
-                    let candidate_init = RTCIceCandidateInit {
-                        candidate: sig.data.clone(),
-                        ..Default::default()
-                    };
-
-                    if let Err(e) = peer_connection_clone
-                        .add_ice_candidate(candidate_init)
-                        .await
-                    {
-                        tracing::warn!("Failed to add ICE candidate: {}", e);
+            let mut candidate_tx = Some(candidate_tx);
+            while let Some(signal) = signal_rx.recv().await {
+                if signal.signal_type != SignalType::Candidate {
+                    continue;
+                }
+                let candidate = match parse_ice_candidate(&signal.data) {
+                    Ok(candidate) => candidate,
+                    Err(e) => {
+                        tracing::warn!("Failed to parse remote candidate: {}", e);
                         continue;
                     }
-
-                    // Notify waiting handler AFTER adding first candidate to peer connection
-                    if first_candidate {
-                        first_candidate = false;
-                        tracing::debug!("First candidate received and added successfully");
-                        let mut notifiers = candidate_notifiers_clone.lock().await;
-                        if let Some(tx) = notifiers.remove(&connection_id) {
-                            let _ = tx.send(());
-                        }
-                    }
+                };
+                if let Err(e) = ice.add_remote_candidate(Some(candidate)).await {
+                    tracing::warn!("Failed to add remote candidate: {}", e);
+                    continue;
+                }
+                if let Some(tx) = candidate_tx.take() {
+                    let _ = tx.send(());
                 }
             }
-            // Clean up dispatcher when channel closes (if not already removed by state handler)
-            {
-                let mut dispatchers = signal_dispatchers_clone.lock().await;
-                dispatchers.remove(&connection_id);
-            }
-
-            // Clean up candidate notifier if it wasn't already removed
-            let mut notifiers = candidate_notifiers_clone.lock().await;
-            notifiers.remove(&connection_id);
+            dispatchers.lock().await.remove(&connection_id);
         });
 
-        // Set remote description (offer)
-        let offer =
-            webrtc::peer_connection::sdp::session_description::RTCSessionDescription::offer(
-                signal.data.clone(),
-            )?;
-        peer_connection.set_remote_description(offer).await?;
-
-        // Create answer
-        let answer = peer_connection.create_answer(None).await?;
-        peer_connection
-            .set_local_description(answer.clone())
-            .await?;
-
-        // Signal the answer
-        let answer_signal =
-            Signal::answer(signal.connection_id, answer.sdp, signal.network_id.clone());
-        signaling.signal(answer_signal).await?;
-
-        // Set up connection state change handler to clean up dispatcher
-        let signal_dispatchers_for_cleanup = signal_dispatchers.clone();
-        peer_connection.on_peer_connection_state_change(Box::new(move |state| {
-            let signal_dispatchers = signal_dispatchers_for_cleanup.clone();
-            Box::pin(async move {
-                use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-                match state {
-                    RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Closed => {
-                        // Remove dispatcher to allow signal_tx to drop and signal_rx to close
-                        let mut dispatchers = signal_dispatchers.lock().await;
-                        dispatchers.remove(&connection_id);
-                    }
-                    _ => {}
-                }
-            })
-        }));
-
-        let session = Arc::new(Session::new(peer_connection.clone()));
-
-        // Channel to notify when data channels are ready
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let ready_tx = Arc::new(tokio::sync::Mutex::new(Some(ready_tx)));
-
-        // Event handler for data channels
-        let session_clone = session.clone();
-        let ready_tx_clone = ready_tx.clone();
-        peer_connection.on_data_channel(Box::new(move |channel| {
-            let session = session_clone.clone();
-            let ready_tx = ready_tx_clone.clone();
-            Box::pin(async move {
-                let label = channel.label().to_string();
-                match label.as_str() {
-                    RELIABLE_CHANNEL => {
-                        let _ = session.set_reliable_channel(channel).await;
-                        // Check if both channels are ready
-                        if session.is_fully_connected().await {
-                            let mut tx_guard = ready_tx.lock().await;
-                            if let Some(tx) = tx_guard.take() {
-                                let _ = tx.send(());
-                            }
-                        }
-                    }
-                    UNRELIABLE_CHANNEL => {
-                        let _ = session.set_unreliable_channel(channel).await;
-                        // Check if both channels are ready
-                        if session.is_fully_connected().await {
-                            let mut tx_guard = ready_tx.lock().await;
-                            if let Some(tx) = tx_guard.take() {
-                                let _ = tx.send(());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            })
-        }));
-
-        // Wait for first ICE candidate and then data channel before adding to incoming queue
-        let session_clone = session.clone();
-        let incoming_tx_clone = incoming_tx.clone();
+        let incoming_tx = incoming_tx.clone();
         tokio::spawn(async move {
-            // Wait for first ICE candidate (with timeout)
-            match tokio::time::timeout(tokio::time::Duration::from_secs(5), candidate_rx).await {
-                Ok(Ok(())) => {
-                    tracing::debug!("Received first ICE candidate");
-                }
-                Ok(Err(_)) => {
-                    tracing::warn!("Candidate notifier dropped before receiving candidate");
-                }
-                Err(_) => {
-                    tracing::warn!("Timeout waiting for first ICE candidate");
-                    let _ = incoming_tx_clone.send(session_clone);
-                    return;
-                }
-            }
-
-            // Wait up to 5 seconds for data channel to be ready
-            match tokio::time::timeout(tokio::time::Duration::from_secs(5), ready_rx).await {
-                Ok(Ok(())) => {
-                    tracing::debug!("Data channel ready, adding session to incoming queue");
-                    let _ = incoming_tx_clone.send(session_clone);
-                }
-                Ok(Err(_)) | Err(_) => {
-                    tracing::warn!("Timeout waiting for data channel to be ready");
-                    // Still add to incoming queue, client will handle the error
-                    let _ = incoming_tx_clone.send(session_clone);
-                }
+            if let Err(e) =
+                Self::start_transports(transports, description, candidate_rx, incoming_tx).await
+            {
+                tracing::debug!("Failed to establish incoming connection: {}", e);
             }
         });
 
+        Ok(())
+    }
+
+    /// Starts the transports of an answered connection and queues the session once the
+    /// remote connection has created both data channels.
+    async fn start_transports(
+        transports: Transports,
+        description: Description,
+        candidate_rx: oneshot::Receiver<()>,
+        incoming_tx: mpsc::UnboundedSender<Arc<Session>>,
+    ) -> Result<()> {
+        tokio::time::timeout(CANDIDATE_TIMEOUT, candidate_rx)
+            .await
+            .map_err(|_| NethernetError::Timeout)?
+            .map_err(|_| NethernetError::ConnectionClosed)?;
+        tracing::debug!("Received first candidate");
+
+        let session = Arc::new(Session::new(
+            transports.ice.clone(),
+            transports.dtls.clone(),
+            transports.sctp.clone(),
+        ));
+
+        let (opened_tx, opened_rx) = oneshot::channel();
+        let opened_tx = Arc::new(Mutex::new(Some(opened_tx)));
+        let session_clone = session.clone();
+        transports
+            .sctp
+            .on_data_channel_opened(Box::new(move |channel| {
+                let session = session_clone.clone();
+                let opened_tx = opened_tx.clone();
+                Box::pin(async move {
+                    let label = channel.label().to_string();
+                    match label.as_str() {
+                        RELIABLE_CHANNEL => {
+                            let _ = session.set_reliable_channel(channel).await;
+                            if let Some(tx) = opened_tx.lock().await.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        UNRELIABLE_CHANNEL => {
+                            let _ = session.set_unreliable_channel(channel).await;
+                        }
+                        _ => {}
+                    }
+                })
+            }));
+
+        tokio::time::timeout(
+            START_TIMEOUT,
+            transports
+                .ice
+                .start(&description.ice, Some(RTCIceRole::Controlled)),
+        )
+        .await
+        .map_err(|_| NethernetError::Timeout)??;
+
+        tokio::time::timeout(START_TIMEOUT, transports.dtls.start(description.dtls))
+            .await
+            .map_err(|_| NethernetError::Timeout)??;
+
+        tokio::time::timeout(
+            START_TIMEOUT,
+            transports
+                .sctp
+                .start(description.sctp, SCTP_PORT, SCTP_PORT),
+        )
+        .await
+        .map_err(|_| NethernetError::Timeout)??;
+
+        tokio::time::timeout(CHANNEL_TIMEOUT, opened_rx)
+            .await
+            .map_err(|_| NethernetError::Timeout)?
+            .map_err(|_| NethernetError::ConnectionClosed)?;
+
+        let _ = incoming_tx.send(session);
         Ok(())
     }
 

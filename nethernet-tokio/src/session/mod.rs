@@ -6,12 +6,16 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing;
 use webrtc::data_channel::RTCDataChannel;
-use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::dtls_transport::RTCDtlsTransport;
+use webrtc::ice_transport::RTCIceTransport;
+use webrtc::ice_transport::ice_transport_state::RTCIceTransportState;
+use webrtc::sctp_transport::RTCSctpTransport;
 
 /// WebRTC session manager
 pub struct Session {
-    peer_connection: Arc<RTCPeerConnection>,
+    ice: Arc<RTCIceTransport>,
+    dtls: Arc<RTCDtlsTransport>,
+    sctp: Arc<RTCSctpTransport>,
     reliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     unreliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     message_buffer: Arc<Mutex<Message>>,
@@ -22,16 +26,27 @@ pub struct Session {
 
 impl Session {
     /// Creates a Session using the default packet channel capacity.
-    pub fn new(peer_connection: Arc<RTCPeerConnection>) -> Self {
-        Self::with_capacity(peer_connection, DEFAULT_PACKET_CHANNEL_CAPACITY)
+    pub fn new(
+        ice: Arc<RTCIceTransport>,
+        dtls: Arc<RTCDtlsTransport>,
+        sctp: Arc<RTCSctpTransport>,
+    ) -> Self {
+        Self::with_capacity(ice, dtls, sctp, DEFAULT_PACKET_CHANNEL_CAPACITY)
     }
 
-    /// Creates a Session backed by the given RTCPeerConnection and a bounded packet channel with the specified capacity.
-    pub fn with_capacity(peer_connection: Arc<RTCPeerConnection>, capacity: usize) -> Self {
+    /// Creates a Session backed by the given transports and a bounded packet channel with the specified capacity.
+    pub fn with_capacity(
+        ice: Arc<RTCIceTransport>,
+        dtls: Arc<RTCDtlsTransport>,
+        sctp: Arc<RTCSctpTransport>,
+        capacity: usize,
+    ) -> Self {
         let (packet_tx, packet_rx) = mpsc::channel(capacity);
 
         Self {
-            peer_connection,
+            ice,
+            dtls,
+            sctp,
             reliable_channel: Arc::new(Mutex::new(None)),
             unreliable_channel: Arc::new(Mutex::new(None)),
             message_buffer: Arc::new(Mutex::new(Message::new())),
@@ -168,22 +183,31 @@ impl Session {
             let _ = channel.close().await;
         }
 
-        self.peer_connection
-            .close()
-            .await
-            .map_err(NethernetError::WebRtc)?;
+        let mut errors = Vec::new();
+        if let Err(e) = self.sctp.stop().await {
+            errors.push(e);
+        }
+        if let Err(e) = self.dtls.stop().await {
+            errors.push(e);
+        }
+        if let Err(e) = self.ice.stop().await {
+            errors.push(e);
+        }
 
-        Ok(())
+        match errors.into_iter().next() {
+            Some(e) => Err(NethernetError::WebRtc(e)),
+            None => Ok(()),
+        }
     }
 
-    /// Returns the current ICE connection state of the underlying peer connection.
-    pub fn connection_state(&self) -> RTCIceConnectionState {
-        self.peer_connection.ice_connection_state()
+    /// Returns the current state of the ICE transport.
+    pub fn connection_state(&self) -> RTCIceTransportState {
+        self.ice.state()
     }
 
-    /// Gets a clone of the session's RTCPeerConnection.
-    pub fn peer_connection(&self) -> Arc<RTCPeerConnection> {
-        self.peer_connection.clone()
+    /// Gets a clone of the session's ICE transport.
+    pub fn ice_transport(&self) -> Arc<RTCIceTransport> {
+        self.ice.clone()
     }
 
     /// Reports whether the session has been closed.
@@ -220,13 +244,13 @@ impl Session {
             );
 
             match state {
-                RTCIceConnectionState::Connected | RTCIceConnectionState::Completed => {
+                RTCIceTransportState::Connected | RTCIceTransportState::Completed => {
                     tracing::info!("WebRTC connection established!");
                     return Ok(());
                 }
-                RTCIceConnectionState::Failed
-                | RTCIceConnectionState::Disconnected
-                | RTCIceConnectionState::Closed => {
+                RTCIceTransportState::Failed
+                | RTCIceTransportState::Disconnected
+                | RTCIceTransportState::Closed => {
                     return Err(NethernetError::ConnectionClosed);
                 }
                 _ => {

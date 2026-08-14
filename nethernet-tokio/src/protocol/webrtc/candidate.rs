@@ -4,7 +4,11 @@
 //! implementation of WebRTC. Candidates in any other representation are ignored
 //! by vanilla clients.
 
+use crate::error::{NethernetError, Result};
 use std::fmt::Write;
+use std::sync::Arc;
+use webrtc::ice::candidate::Candidate;
+use webrtc::ice::candidate::candidate_base::unmarshal_candidate;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 
@@ -39,6 +43,16 @@ pub fn format_ice_candidate(index: usize, candidate: &RTCIceCandidate, ufrag: &s
         ufrag, index
     );
     s
+}
+
+/// Parses a candidate signaled by a remote connection.
+pub fn parse_ice_candidate(data: &str) -> Result<RTCIceCandidate> {
+    let raw = data.strip_prefix("candidate:").unwrap_or(data);
+    let candidate: Arc<dyn Candidate + Send + Sync> = Arc::new(
+        unmarshal_candidate(raw)
+            .map_err(|e| NethernetError::Other(format!("decode candidate: {}", e)))?,
+    );
+    Ok(RTCIceCandidate::from(&candidate))
 }
 
 #[cfg(test)]
