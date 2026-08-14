@@ -117,7 +117,7 @@ impl NethernetStream {
                 let Some(signal) = signals.next().await else {
                     return Err(NethernetError::ConnectionClosed);
                 };
-                if signal.connection_id != connection_id {
+                if signal.connection_id != connection_id || signal.network_id != remote_network_id {
                     continue;
                 }
                 match signal.signal_type {
@@ -151,6 +151,7 @@ impl NethernetStream {
             let mut candidate_tx = Some(candidate_tx);
             while let Some(signal) = signals.next().await {
                 if signal.connection_id != connection_id
+                    || signal.network_id != remote_network_id
                     || signal.signal_type != SignalType::Candidate
                 {
                     continue;

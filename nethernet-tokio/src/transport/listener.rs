@@ -29,7 +29,11 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time to wait for the data channels created by the remote connection.
 const CHANNEL_TIMEOUT: Duration = Duration::from_secs(5);
 
-type SignalDispatchers = Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Signal>>>>;
+/// Connections are referenced by both the remote network ID and the connection ID, as
+/// connection IDs are only unique within a single network.
+type ConnectionKey = (String, u64);
+
+type SignalDispatchers = Arc<Mutex<HashMap<ConnectionKey, mpsc::UnboundedSender<Signal>>>>;
 
 /// NetherNet listener - accepts WebRTC connections
 pub struct NethernetListener<S: Signaling> {
@@ -103,7 +107,8 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                                     SignalType::Answer | SignalType::Candidate | SignalType::Error => {
                                         // Dispatch to per-connection channel
                                         let dispatchers = signal_dispatchers.lock().await;
-                                        if let Some(tx) = dispatchers.get(&signal.connection_id) {
+                                        let key = (signal.network_id.clone(), signal.connection_id);
+                                        if let Some(tx) = dispatchers.get(&key) {
                                             let _ = tx.send(signal);
                                         }
                                     }
@@ -136,12 +141,13 @@ impl<S: Signaling + 'static> NethernetListener<S> {
 
         let connection_id = signal.connection_id;
         let network_id = signal.network_id;
+        let key = (network_id.clone(), connection_id);
 
         let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
         signal_dispatchers
             .lock()
             .await
-            .insert(connection_id, signal_tx);
+            .insert(key.clone(), signal_tx);
 
         signaling
             .signal(Signal::answer(connection_id, answer, network_id.clone()))
@@ -180,7 +186,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                     let _ = tx.send(());
                 }
             }
-            dispatchers.lock().await.remove(&connection_id);
+            dispatchers.lock().await.remove(&key);
         });
 
         let incoming_tx = incoming_tx.clone();
