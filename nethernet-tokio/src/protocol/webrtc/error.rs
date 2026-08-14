@@ -3,8 +3,8 @@
 //! These error codes are sent in CONNECTERROR messages during WebRTC negotiation.
 //!
 //! Note: [`ConnectError`] and [`crate::error::SignalErrorCode`] represent the same logical
-//! error conditions but use different wire formats (u8 vs u32) and have different discriminant
-//! values. ConnectError has a gap at 0x14 in its discriminant sequence.
+//! error conditions and share the same wire codes, but use different in-memory
+//! representations (u8 vs u32).
 
 /// WebRTC connection error codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -51,19 +51,19 @@ pub enum ConnectError {
     #[error("signaling unicast message delivery failed")]
     SignalingUnicastMessageDeliveryFailed = 0x13,
     #[error("signaling broadcast delivery failed")]
-    SignalingBroadcastDeliveryFailed = 0x15,
+    SignalingBroadcastDeliveryFailed = 0x14,
     #[error("signaling message delivery failed")]
-    SignalingMessageDeliveryFailed = 0x16,
+    SignalingMessageDeliveryFailed = 0x15,
     #[error("signaling TURN auth failed")]
-    SignalingTurnAuthFailed = 0x17,
+    SignalingTurnAuthFailed = 0x16,
     #[error("signaling fallback to best effort delivery")]
-    SignalingFallbackToBestEffortDelivery = 0x18,
+    SignalingFallbackToBestEffortDelivery = 0x17,
     #[error("no signaling channel")]
-    NoSignalingChannel = 0x19,
+    NoSignalingChannel = 0x18,
     #[error("not logged in")]
-    NotLoggedIn = 0x1a,
+    NotLoggedIn = 0x19,
     #[error("signaling failed to send")]
-    SignalingFailedToSend = 0x1b,
+    SignalingFailedToSend = 0x1a,
 }
 
 impl ConnectError {
@@ -92,13 +92,13 @@ impl ConnectError {
             0x11 => Some(Self::SignalingParsingFailure),
             0x12 => Some(Self::SignalingUnknownError),
             0x13 => Some(Self::SignalingUnicastMessageDeliveryFailed),
-            0x15 => Some(Self::SignalingBroadcastDeliveryFailed),
-            0x16 => Some(Self::SignalingMessageDeliveryFailed),
-            0x17 => Some(Self::SignalingTurnAuthFailed),
-            0x18 => Some(Self::SignalingFallbackToBestEffortDelivery),
-            0x19 => Some(Self::NoSignalingChannel),
-            0x1a => Some(Self::NotLoggedIn),
-            0x1b => Some(Self::SignalingFailedToSend),
+            0x14 => Some(Self::SignalingBroadcastDeliveryFailed),
+            0x15 => Some(Self::SignalingMessageDeliveryFailed),
+            0x16 => Some(Self::SignalingTurnAuthFailed),
+            0x17 => Some(Self::SignalingFallbackToBestEffortDelivery),
+            0x18 => Some(Self::NoSignalingChannel),
+            0x19 => Some(Self::NotLoggedIn),
+            0x1a => Some(Self::SignalingFailedToSend),
             _ => None,
         }
     }
@@ -275,32 +275,24 @@ mod tests {
     }
 
     #[test]
-    fn test_discriminant_gap_handling() {
-        // Test that the 0x14 gap is handled correctly
-        // SignalingBroadcastDeliveryFailed should be 0x15 in ConnectError
-        let connect_error = ConnectError::SignalingBroadcastDeliveryFailed;
-        assert_eq!(connect_error.code(), 0x15);
-
-        // SignalingUnicastMessageDeliveryFailed should be 0x13 in ConnectError
-        let connect_error = ConnectError::SignalingUnicastMessageDeliveryFailed;
-        assert_eq!(connect_error.code(), 0x13);
-
-        // Verify the gap: no variant at 0x14
-        assert_eq!(ConnectError::from_code(0x14), None);
+    fn test_wire_codes_are_sequential() {
+        assert_eq!(
+            ConnectError::SignalingUnicastMessageDeliveryFailed.code(),
+            0x13
+        );
+        assert_eq!(ConnectError::SignalingBroadcastDeliveryFailed.code(), 0x14);
+        assert_eq!(ConnectError::SignalingFailedToSend.code(), 0x1a);
+        assert_eq!(ConnectError::from_code(0x1b), None);
     }
 
     #[test]
     fn test_discriminant_values() {
-        // Verify that ConnectError and SignalErrorCode map correctly despite different discriminants
         let signal_broadcast = SignalErrorCode::SignalingBroadcastDeliveryFailed;
         let connect_broadcast: ConnectError = signal_broadcast.into();
 
-        // SignalErrorCode uses sequential values (20 for SignalingBroadcastDeliveryFailed)
         assert_eq!(signal_broadcast as u32, 20);
-        // ConnectError has a gap and uses 0x15 (21)
-        assert_eq!(connect_broadcast.code(), 0x15);
+        assert_eq!(connect_broadcast.code() as u32, signal_broadcast as u32);
 
-        // But they should still round-trip correctly
         let back_to_signal: SignalErrorCode = connect_broadcast.into();
         assert_eq!(signal_broadcast, back_to_signal);
     }
