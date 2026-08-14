@@ -5,7 +5,7 @@ use crate::protocol::webrtc::{Description, format_ice_candidate, parse_ice_candi
 use crate::protocol::{Signal, SignalType};
 use crate::session::Session;
 use crate::signaling::Signaling;
-use crate::transport::Transports;
+use crate::transport::{ConnectionConfig, Transports};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use rand::Rng;
@@ -25,21 +25,13 @@ use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::ice::network_type::NetworkType;
 use webrtc::ice_transport::ice_role::RTCIceRole;
 
-/// Time to wait for the answer of the remote connection.
-const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Time to wait for the first candidate signaled by the remote connection.
-const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Time to wait for each transport to start.
-const START_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Starts a transport, reporting the error code to be signaled back to the remote
 /// connection when it does not start in time.
 async fn start_transport(
     start: impl Future<Output = std::result::Result<(), webrtc::Error>>,
+    timeout: Duration,
 ) -> std::result::Result<(), (Option<SignalErrorCode>, NethernetError)> {
-    match tokio::time::timeout(START_TIMEOUT, start).await {
+    match tokio::time::timeout(timeout, start).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err((Some(SignalErrorCode::Ice), NethernetError::WebRtc(e))),
         Err(_) => Err((
@@ -100,11 +92,20 @@ impl NethernetStream {
         signaling: Arc<S>,
         remote_network_id: String,
     ) -> Result<Self> {
+        Self::connect_with(signaling, remote_network_id, ConnectionConfig::default()).await
+    }
+
+    /// Establishes a NethernetStream using the timeouts of the given configuration.
+    pub async fn connect_with<S: Signaling + 'static>(
+        signaling: Arc<S>,
+        remote_network_id: String,
+        config: ConnectionConfig,
+    ) -> Result<Self> {
         let mut connection_id_bytes = [0u8; 8];
         rand::rng().fill_bytes(&mut connection_id_bytes);
         let connection_id = u64::from_le_bytes(connection_id_bytes);
 
-        match Self::negotiate(&signaling, &remote_network_id, connection_id).await {
+        match Self::negotiate(&signaling, &remote_network_id, connection_id, config).await {
             Ok(stream) => Ok(stream),
             Err((code, e)) => {
                 if let Some(code) = code {
@@ -127,6 +128,7 @@ impl NethernetStream {
         signaling: &Arc<S>,
         remote_network_id: &str,
         connection_id: u64,
+        config: ConnectionConfig,
     ) -> std::result::Result<Self, (Option<SignalErrorCode>, NethernetError)> {
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_network_types(vec![NetworkType::Udp4]);
@@ -169,7 +171,7 @@ impl NethernetStream {
         }
 
         let mut pending_candidates = Vec::new();
-        let answer = tokio::time::timeout(NEGOTIATION_TIMEOUT, async {
+        let answer = tokio::time::timeout(config.negotiation_timeout, async {
             loop {
                 let Some(signal) = signals.next().await else {
                     return Err((None, NethernetError::ConnectionClosed));
@@ -270,7 +272,7 @@ impl NethernetStream {
         });
 
         if !candidate_received {
-            tokio::time::timeout(CANDIDATE_TIMEOUT, candidate_rx)
+            tokio::time::timeout(config.candidate_timeout, candidate_rx)
                 .await
                 .map_err(|_| {
                     (
@@ -286,13 +288,19 @@ impl NethernetStream {
             transports
                 .ice
                 .start(&description.ice, Some(RTCIceRole::Controlling)),
+            config.start_timeout,
         )
         .await?;
-        start_transport(transports.dtls.start(description.dtls)).await?;
+        start_transport(
+            transports.dtls.start(description.dtls),
+            config.start_timeout,
+        )
+        .await?;
         start_transport(
             transports
                 .sctp
                 .start(description.sctp, SCTP_PORT, SCTP_PORT),
+            config.start_timeout,
         )
         .await?;
 

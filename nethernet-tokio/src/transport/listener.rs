@@ -5,8 +5,8 @@ use crate::protocol::webrtc::{Description, format_ice_candidate, parse_ice_candi
 use crate::protocol::{Signal, SignalType};
 use crate::session::Session;
 use crate::signaling::Signaling;
-use crate::transport::Transports;
 use crate::transport::stream::parse_error_code;
+use crate::transport::{ConnectionConfig, Transports};
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::future::Future;
@@ -21,15 +21,6 @@ use tokio_util::sync::CancellationToken;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::ice_transport::ice_role::RTCIceRole;
-
-/// Time to wait for the first candidate signaled by the remote connection.
-const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Time to wait for each transport to start.
-const START_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Time to wait for the data channels created by the remote connection.
-const CHANNEL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Signals an error back to the remote connection referenced by the IDs.
 async fn signal_error<S: Signaling>(
@@ -50,8 +41,9 @@ async fn signal_error<S: Signaling>(
 /// connection when it does not start in time.
 async fn start_transport(
     start: impl Future<Output = std::result::Result<(), webrtc::Error>>,
+    timeout: Duration,
 ) -> std::result::Result<(), (Option<SignalErrorCode>, NethernetError)> {
-    match tokio::time::timeout(START_TIMEOUT, start).await {
+    match tokio::time::timeout(timeout, start).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err((Some(SignalErrorCode::Ice), NethernetError::WebRtc(e))),
         Err(_) => Err((
@@ -83,6 +75,11 @@ impl<S: Signaling + 'static> NethernetListener<S> {
     /// The returned listener is ready to accept inbound WebRTC sessions. It initializes internal queues and dispatch
     /// structures, and spawns a background task to process signaling events; dropping the listener cancels that task.
     pub async fn bind(signaling: S) -> Result<Self> {
+        Self::bind_with(signaling, ConnectionConfig::default()).await
+    }
+
+    /// Creates a [`NethernetListener`] using the timeouts of the given configuration.
+    pub async fn bind_with(signaling: S, config: ConnectionConfig) -> Result<Self> {
         let signaling = Arc::new(signaling);
         let local_addr = Addr::network(signaling.network_id());
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
@@ -95,6 +92,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             incoming_tx,
             signal_dispatchers.clone(),
             cancel_token.clone(),
+            config,
         );
 
         let listener = Self {
@@ -114,6 +112,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         incoming_tx: mpsc::UnboundedSender<Arc<Session>>,
         signal_dispatchers: SignalDispatchers,
         cancel_token: CancellationToken,
+        config: ConnectionConfig,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut signals = signaling.signals();
@@ -133,6 +132,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                                             &signaling,
                                             &incoming_tx,
                                             &signal_dispatchers,
+                                            config,
                                         )
                                         .await
                                         {
@@ -164,11 +164,12 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         signaling: &Arc<S>,
         incoming_tx: &mpsc::UnboundedSender<Arc<Session>>,
         signal_dispatchers: &SignalDispatchers,
+        config: ConnectionConfig,
     ) -> Result<()> {
         let connection_id = signal.connection_id;
         let network_id = signal.network_id.clone();
 
-        match Self::answer_offer(signal, signaling, incoming_tx, signal_dispatchers).await {
+        match Self::answer_offer(signal, signaling, incoming_tx, signal_dispatchers, config).await {
             Ok(()) => Ok(()),
             Err((code, e)) => {
                 if let Some(code) = code {
@@ -186,6 +187,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         signaling: &Arc<S>,
         incoming_tx: &mpsc::UnboundedSender<Arc<Session>>,
         signal_dispatchers: &SignalDispatchers,
+        config: ConnectionConfig,
     ) -> std::result::Result<(), (Option<SignalErrorCode>, NethernetError)> {
         let description = Description::parse(&signal.data)
             .map_err(|e| (Some(SignalErrorCode::FailedToSetRemoteDescription), e))?;
@@ -285,9 +287,15 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let incoming_tx = incoming_tx.clone();
         let signaling = signaling.clone();
         tokio::spawn(async move {
-            if let Err((code, e)) =
-                Self::start_transports(transports, session, description, candidate_rx, incoming_tx)
-                    .await
+            if let Err((code, e)) = Self::start_transports(
+                transports,
+                session,
+                description,
+                candidate_rx,
+                incoming_tx,
+                config,
+            )
+            .await
             {
                 tracing::debug!("Failed to establish incoming connection: {}", e);
                 if let Some(code) = code {
@@ -307,8 +315,9 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         description: Description,
         candidate_rx: oneshot::Receiver<()>,
         incoming_tx: mpsc::UnboundedSender<Arc<Session>>,
+        config: ConnectionConfig,
     ) -> std::result::Result<(), (Option<SignalErrorCode>, NethernetError)> {
-        tokio::time::timeout(CANDIDATE_TIMEOUT, candidate_rx)
+        tokio::time::timeout(config.candidate_timeout, candidate_rx)
             .await
             .map_err(|_| {
                 (
@@ -348,17 +357,23 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             transports
                 .ice
                 .start(&description.ice, Some(RTCIceRole::Controlled)),
+            config.start_timeout,
         )
         .await?;
-        start_transport(transports.dtls.start(description.dtls)).await?;
+        start_transport(
+            transports.dtls.start(description.dtls),
+            config.start_timeout,
+        )
+        .await?;
         start_transport(
             transports
                 .sctp
                 .start(description.sctp, SCTP_PORT, SCTP_PORT),
+            config.start_timeout,
         )
         .await?;
 
-        tokio::time::timeout(CHANNEL_TIMEOUT, opened_rx)
+        tokio::time::timeout(config.channel_timeout, opened_rx)
             .await
             .map_err(|_| {
                 (
