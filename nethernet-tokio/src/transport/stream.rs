@@ -375,6 +375,16 @@ impl NethernetStream {
         self.session.send(data).await
     }
 
+    /// Transmits a payload over the unreliable data channel of this stream.
+    pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
+        self.session.send_unreliable(data).await
+    }
+
+    /// Receive the next available data frame from the unreliable data channel.
+    pub async fn recv_unreliable(&self) -> Result<Option<Bytes>> {
+        self.session.recv_unreliable().await
+    }
+
     /// Receive the next available data frame from this stream.
     pub async fn recv(&self) -> Result<Option<Bytes>> {
         self.session.recv().await

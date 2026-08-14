@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::data_channel::data_channel_parameters::DataChannelParameters;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::ice_transport::ice_role::RTCIceRole;
 
@@ -56,6 +57,9 @@ async fn start_transport(
 /// Connections are referenced by both the remote network ID and the connection ID, as
 /// connection IDs are only unique within a single network.
 type ConnectionKey = (String, u64);
+
+/// Time the remote connection is given to open the unreliable data channel in band.
+const UNRELIABLE_GRACE: Duration = Duration::from_millis(250);
 
 type SignalDispatchers = Arc<Mutex<HashMap<ConnectionKey, mpsc::UnboundedSender<Signal>>>>;
 
@@ -338,14 +342,25 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             .map_err(|_| (None, NethernetError::ConnectionClosed))?;
         tracing::debug!("Received first candidate");
 
+        // The remote connection allocates its stream IDs from the base of its DTLS role,
+        // so the unreliable channel follows its reliable channel.
+        let unreliable_id = if description.dtls.role == DTLSRole::Server {
+            3
+        } else {
+            2
+        };
+
         let (opened_tx, opened_rx) = oneshot::channel();
+        let (unreliable_tx, unreliable_rx) = oneshot::channel();
         let opened_tx = Arc::new(Mutex::new(Some(opened_tx)));
+        let unreliable_tx = Arc::new(Mutex::new(Some(unreliable_tx)));
         let session_clone = session.clone();
         transports
             .sctp
             .on_data_channel_opened(Box::new(move |channel| {
                 let session = session_clone.clone();
                 let opened_tx = opened_tx.clone();
+                let unreliable_tx = unreliable_tx.clone();
                 Box::pin(async move {
                     let label = channel.label().to_string();
                     match label.as_str() {
@@ -357,6 +372,9 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                         }
                         UNRELIABLE_CHANNEL => {
                             let _ = session.set_unreliable_channel(channel).await;
+                            if let Some(tx) = unreliable_tx.lock().await.take() {
+                                let _ = tx.send(());
+                            }
                         }
                         _ => {}
                     }
@@ -393,8 +411,48 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             })?
             .map_err(|_| (None, NethernetError::ConnectionClosed))?;
 
+        Self::pair_unreliable_channel(&transports, &session, unreliable_rx, unreliable_id).await;
+
         let _ = incoming_tx.send(session);
         Ok(())
+    }
+
+    /// Opens the unreliable data channel out of band when the remote connection did not
+    /// create it in band.
+    ///
+    /// Remote connections that cannot allocate a second stream ID in band signal the
+    /// unreliable channel by opening it out of band on the stream following the reliable
+    /// channel, which is the layout vanilla clients use as well.
+    async fn pair_unreliable_channel(
+        transports: &Transports,
+        session: &Arc<Session>,
+        unreliable_rx: oneshot::Receiver<()>,
+        unreliable_id: u16,
+    ) {
+        if tokio::time::timeout(UNRELIABLE_GRACE, unreliable_rx)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        match transports
+            .api
+            .new_data_channel(
+                transports.sctp.clone(),
+                DataChannelParameters {
+                    label: UNRELIABLE_CHANNEL.to_string(),
+                    max_retransmits: Some(0),
+                    negotiated: Some(unreliable_id),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(channel) => {
+                let _ = session.set_unreliable_channel(Arc::new(channel)).await;
+            }
+            Err(e) => tracing::debug!("Failed to open unreliable channel: {}", e),
+        }
     }
 
     /// Waits for and returns the next inbound session.

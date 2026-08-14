@@ -205,8 +205,11 @@ impl Session {
     /// # Errors
     ///
     /// - Returns `NethernetError::ConnectionClosed` if the session has been closed.
-    /// - Returns `NethernetError::DataChannel(...)` if the unreliable channel is not set,
-    ///   if it was opened out of band, or if sending a segment fails.
+    /// - Returns `NethernetError::DataChannel(...)` if the unreliable channel is not set
+    ///   or if sending a segment fails.
+    ///
+    /// Data sent over a channel that was opened out of band is dropped by remote
+    /// connections that did not open the matching channel themselves.
     pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
         if *self.closed.read().await {
             return Err(NethernetError::ConnectionClosed);
@@ -221,13 +224,6 @@ impl Session {
                 })?
                 .clone()
         };
-        if channel.negotiated() {
-            return Err(NethernetError::DataChannel(
-                "Unreliable channel was opened out of band and is unknown to the remote connection"
-                    .to_string(),
-            ));
-        }
-
         for segment in Message::split_into_segments(data)? {
             channel
                 .send(&segment.encode())
