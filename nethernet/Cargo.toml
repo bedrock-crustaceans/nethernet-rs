@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 rtc = "0.20"
+http = "1"
 thiserror = "2"

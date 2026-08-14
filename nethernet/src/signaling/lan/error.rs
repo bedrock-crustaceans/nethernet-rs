@@ -1,3 +1,1 @@
-pub enum LanSignalerError {
-    
-}
+pub enum LanSignalerError {}

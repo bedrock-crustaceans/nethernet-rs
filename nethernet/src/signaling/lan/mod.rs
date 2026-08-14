@@ -1,15 +1,13 @@
+pub mod error;
 pub mod input;
 pub mod output;
-pub mod error;
 
 use crate::sans::Sans;
 use crate::signaling::lan::error::LanSignalerError;
 use crate::signaling::lan::input::LanSignalerInput;
 use crate::signaling::lan::output::LanSignalerOutput;
 
-pub struct LanSignaler {
-    
-}
+pub struct LanSignaler {}
 
 impl Sans for LanSignaler {
     type Input = LanSignalerInput;

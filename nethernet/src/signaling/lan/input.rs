@@ -1,3 +1,1 @@
-pub enum LanSignalerInput {
-    
-}
+pub enum LanSignalerInput {}
