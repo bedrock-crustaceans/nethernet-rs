@@ -133,7 +133,8 @@ impl<S: Signaling + 'static> NethernetListener<S> {
     ) -> Result<()> {
         let description = Description::parse(&signal.data)?;
 
-        let transports = Transports::new(SettingEngine::default())?;
+        let credentials = signaling.credentials().await?;
+        let transports = Transports::new(SettingEngine::default(), credentials.as_ref())?;
         let (candidates, ice_parameters) = transports.gather().await?;
 
         let answer = transports

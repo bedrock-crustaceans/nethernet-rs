@@ -79,7 +79,8 @@ impl NethernetStream {
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_network_types(vec![NetworkType::Udp4]);
 
-        let transports = Transports::new(setting_engine)?;
+        let credentials = signaling.credentials().await?;
+        let transports = Transports::new(setting_engine, credentials.as_ref())?;
         let (candidates, ice_parameters) = transports.gather().await?;
 
         let offer = transports

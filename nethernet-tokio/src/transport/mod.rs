@@ -4,6 +4,7 @@ pub mod stream;
 pub use listener::NethernetListener;
 pub use stream::NethernetStream;
 
+use crate::credentials::{Credentials, gather_options};
 use crate::error::{NethernetError, Result};
 use crate::protocol::constants::SCTP_MAX_MESSAGE_SIZE;
 use crate::protocol::webrtc::Description;
@@ -16,7 +17,7 @@ use webrtc::dtls_transport::RTCDtlsTransport;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::ice_transport::RTCIceTransport;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-use webrtc::ice_transport::ice_gatherer::{RTCIceGatherOptions, RTCIceGatherer};
+use webrtc::ice_transport::ice_gatherer::RTCIceGatherer;
 use webrtc::ice_transport::ice_parameters::RTCIceParameters;
 use webrtc::sctp_transport::RTCSctpTransport;
 use webrtc::sctp_transport::sctp_transport_capabilities::SCTPTransportCapabilities;
@@ -35,13 +36,16 @@ pub(crate) struct Transports {
 }
 
 impl Transports {
-    pub(crate) fn new(setting_engine: SettingEngine) -> Result<Self> {
+    pub(crate) fn new(
+        setting_engine: SettingEngine,
+        credentials: Option<&Credentials>,
+    ) -> Result<Self> {
         let api = APIBuilder::new()
             .with_media_engine(MediaEngine::default())
             .with_setting_engine(setting_engine)
             .build();
 
-        let gatherer = Arc::new(api.new_ice_gatherer(RTCIceGatherOptions::default())?);
+        let gatherer = Arc::new(api.new_ice_gatherer(gather_options(credentials))?);
         let ice = Arc::new(api.new_ice_transport(gatherer.clone()));
         let dtls = Arc::new(api.new_dtls_transport(ice.clone(), vec![])?);
         let sctp = Arc::new(api.new_sctp_transport(dtls.clone())?);
