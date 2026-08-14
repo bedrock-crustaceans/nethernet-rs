@@ -52,6 +52,10 @@ pub enum NethernetError {
     #[error("Invalid state: {0}")]
     InvalidState(String),
 
+    /// Error signaled by the remote connection
+    #[error("connection failed with code {0:?}")]
+    Signaled(SignalErrorCode),
+
     /// General error
     #[error("{0}")]
     Other(String),
