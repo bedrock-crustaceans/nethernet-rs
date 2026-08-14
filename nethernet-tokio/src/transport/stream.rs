@@ -105,7 +105,13 @@ impl NethernetStream {
         rand::rng().fill_bytes(&mut connection_id_bytes);
         let connection_id = u64::from_le_bytes(connection_id_bytes);
 
-        match Self::negotiate(&signaling, &remote_network_id, connection_id, config).await {
+        let cancel_token = config.cancel_token.clone();
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => Err((None, NethernetError::ConnectionClosed)),
+            result = Self::negotiate(&signaling, &remote_network_id, connection_id, config) => result,
+        };
+
+        match result {
             Ok(stream) => Ok(stream),
             Err((code, e)) => {
                 if let Some(code) = code {
@@ -171,7 +177,7 @@ impl NethernetStream {
         }
 
         let mut pending_candidates = Vec::new();
-        let answer = tokio::time::timeout(config.negotiation_timeout, async {
+        let answer = tokio::time::timeout(config.timeouts.negotiation, async {
             loop {
                 let Some(signal) = signals.next().await else {
                     return Err((None, NethernetError::ConnectionClosed));
@@ -272,7 +278,7 @@ impl NethernetStream {
         });
 
         if !candidate_received {
-            tokio::time::timeout(config.candidate_timeout, candidate_rx)
+            tokio::time::timeout(config.timeouts.candidate, candidate_rx)
                 .await
                 .map_err(|_| {
                     (
@@ -288,19 +294,19 @@ impl NethernetStream {
             transports
                 .ice
                 .start(&description.ice, Some(RTCIceRole::Controlling)),
-            config.start_timeout,
+            config.timeouts.start,
         )
         .await?;
         start_transport(
             transports.dtls.start(description.dtls),
-            config.start_timeout,
+            config.timeouts.start,
         )
         .await?;
         start_transport(
             transports
                 .sctp
                 .start(description.sctp, SCTP_PORT, SCTP_PORT),
-            config.start_timeout,
+            config.timeouts.start,
         )
         .await?;
 

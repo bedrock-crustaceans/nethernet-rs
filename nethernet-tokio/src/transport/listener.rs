@@ -132,7 +132,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                                             &signaling,
                                             &incoming_tx,
                                             &signal_dispatchers,
-                                            config,
+                                            config.clone(),
                                         )
                                         .await
                                         {
@@ -169,7 +169,13 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let connection_id = signal.connection_id;
         let network_id = signal.network_id.clone();
 
-        match Self::answer_offer(signal, signaling, incoming_tx, signal_dispatchers, config).await {
+        let cancel_token = config.cancel_token.clone();
+        let result = tokio::select! {
+            _ = cancel_token.cancelled() => Err((None, NethernetError::ConnectionClosed)),
+            result = Self::answer_offer(signal, signaling, incoming_tx, signal_dispatchers, config.clone()) => result,
+        };
+
+        match result {
             Ok(()) => Ok(()),
             Err((code, e)) => {
                 if let Some(code) = code {
@@ -287,16 +293,20 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let incoming_tx = incoming_tx.clone();
         let signaling = signaling.clone();
         tokio::spawn(async move {
-            if let Err((code, e)) = Self::start_transports(
-                transports,
-                session,
-                description,
-                candidate_rx,
-                incoming_tx,
-                config,
-            )
-            .await
-            {
+            let cancel_token = config.cancel_token.clone();
+            let result = tokio::select! {
+                _ = cancel_token.cancelled() => Err((None, NethernetError::ConnectionClosed)),
+                result = Self::start_transports(
+                    transports,
+                    session,
+                    description,
+                    candidate_rx,
+                    incoming_tx,
+                    config,
+                ) => result,
+            };
+
+            if let Err((code, e)) = result {
                 tracing::debug!("Failed to establish incoming connection: {}", e);
                 if let Some(code) = code {
                     signal_error(&signaling, connection_id, network_id, code).await;
@@ -317,7 +327,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         incoming_tx: mpsc::UnboundedSender<Arc<Session>>,
         config: ConnectionConfig,
     ) -> std::result::Result<(), (Option<SignalErrorCode>, NethernetError)> {
-        tokio::time::timeout(config.candidate_timeout, candidate_rx)
+        tokio::time::timeout(config.timeouts.candidate, candidate_rx)
             .await
             .map_err(|_| {
                 (
@@ -357,23 +367,23 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             transports
                 .ice
                 .start(&description.ice, Some(RTCIceRole::Controlled)),
-            config.start_timeout,
+            config.timeouts.start,
         )
         .await?;
         start_transport(
             transports.dtls.start(description.dtls),
-            config.start_timeout,
+            config.timeouts.start,
         )
         .await?;
         start_transport(
             transports
                 .sctp
                 .start(description.sctp, SCTP_PORT, SCTP_PORT),
-            config.start_timeout,
+            config.timeouts.start,
         )
         .await?;
 
-        tokio::time::timeout(config.channel_timeout, opened_rx)
+        tokio::time::timeout(config.timeouts.channel, opened_rx)
             .await
             .map_err(|_| {
                 (

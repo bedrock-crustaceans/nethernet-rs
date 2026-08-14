@@ -11,6 +11,7 @@ use crate::protocol::webrtc::Description;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::{API, APIBuilder};
@@ -23,30 +24,41 @@ use webrtc::ice_transport::ice_parameters::RTCIceParameters;
 use webrtc::sctp_transport::RTCSctpTransport;
 use webrtc::sctp_transport::sctp_transport_capabilities::SCTPTransportCapabilities;
 
+/// Options applied while negotiating and establishing a connection.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionConfig {
+    /// Timeouts of each negotiation step.
+    pub timeouts: Timeouts,
+
+    /// Cancels the negotiation when triggered. Connections that are already established
+    /// are unaffected, as they are closed through the session itself.
+    pub cancel_token: CancellationToken,
+}
+
 /// Timeouts applied while negotiating and establishing a connection.
 #[derive(Debug, Clone, Copy)]
-pub struct ConnectionConfig {
+pub struct Timeouts {
     /// Time to wait for the answer of the remote connection. Only used while dialing.
-    pub negotiation_timeout: Duration,
+    pub negotiation: Duration,
 
     /// Time to wait for the first candidate signaled by the remote connection.
-    pub candidate_timeout: Duration,
+    pub candidate: Duration,
 
     /// Time to wait for each transport to start.
-    pub start_timeout: Duration,
+    pub start: Duration,
 
     /// Time to wait for the data channels created by the remote connection. Only used
     /// while listening, as the dialing side creates them itself.
-    pub channel_timeout: Duration,
+    pub channel: Duration,
 }
 
-impl Default for ConnectionConfig {
+impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            negotiation_timeout: Duration::from_secs(15),
-            candidate_timeout: Duration::from_secs(5),
-            start_timeout: Duration::from_secs(5),
-            channel_timeout: Duration::from_secs(5),
+            negotiation: Duration::from_secs(15),
+            candidate: Duration::from_secs(5),
+            start: Duration::from_secs(5),
+            channel: Duration::from_secs(5),
         }
     }
 }

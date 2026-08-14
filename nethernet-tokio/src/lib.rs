@@ -24,4 +24,4 @@ pub use protocol::{ConnectError, Message, MessageSegment, Signal, SignalType};
 pub use session::Session;
 pub use signaling::Signaling;
 pub use signaling::lan::{LanConfig, LanSignaling};
-pub use transport::{ConnectionConfig, NethernetListener, NethernetStream};
+pub use transport::{ConnectionConfig, NethernetListener, NethernetStream, Timeouts};
