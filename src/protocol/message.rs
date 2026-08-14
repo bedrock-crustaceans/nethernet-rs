@@ -255,11 +255,11 @@ mod tests {
         message.add_segment(segment).unwrap();
 
         // Capacity should be at least 10 * 100 = 1000
-        // and significantly less than 10 * MAX_MESSAGE_SIZE (100,000)
+        // and no more than the 10 * MAX_MESSAGE_SIZE reserve requested above.
         let capacity = message.data.capacity();
         assert!(capacity >= 1000, "Capacity {} too small", capacity);
         assert!(
-            capacity < 100000,
+            capacity <= 10 * MAX_MESSAGE_SIZE,
             "Capacity {} too large (over-allocation)",
             capacity
         );

@@ -5,7 +5,7 @@
 
 use crate::error::{NethernetError, Result};
 use aes::Aes256;
-use aes::cipher::{Block, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{Block, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
@@ -23,11 +23,15 @@ static ENCRYPTION_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
 });
 
 /// Pre-initialized AES-256 cipher for encryption and decryption.
-static CIPHER: LazyLock<Aes256> = LazyLock::new(|| Aes256::new(ENCRYPTION_KEY.as_slice().into()));
+///
+/// The key is passed as `&[u8; 32]` rather than `&[u8]`: `cipher` 0.5 sizes `Key`
+/// as a `hybrid-array` `Array<u8, U32>`, which converts from a fixed-size array
+/// reference but not from an unsized slice.
+static CIPHER: LazyLock<Aes256> = LazyLock::new(|| Aes256::new((&*ENCRYPTION_KEY).into()));
 
 /// Pre-initialized HMAC-SHA256 state to avoid re-computing the key schedule.
 static HMAC_STATE: LazyLock<Hmac<Sha256>> = LazyLock::new(|| {
-    <Hmac<Sha256> as Mac>::new_from_slice(ENCRYPTION_KEY.as_slice())
+    <Hmac<Sha256> as KeyInit>::new_from_slice(ENCRYPTION_KEY.as_slice())
         .expect("HMAC can take key of any size")
 });
 
