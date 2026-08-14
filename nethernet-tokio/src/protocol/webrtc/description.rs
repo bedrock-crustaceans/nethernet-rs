@@ -7,18 +7,20 @@
 
 use crate::error::{NethernetError, Result};
 use crate::protocol::constants::SCTP_PORT;
+use crate::protocol::webrtc::{format_ice_candidate, parse_ice_candidate};
 use rand::RngExt;
 use std::io::Cursor;
 use webrtc::dtls_transport::dtls_fingerprint::RTCDtlsFingerprint;
 use webrtc::dtls_transport::dtls_parameters::DTLSParameters;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_parameters::RTCIceParameters;
 use webrtc::sctp_transport::sctp_transport_capabilities::SCTPTransportCapabilities;
 use webrtc::sdp::description::common::{Address, Attribute, ConnectionInformation};
 use webrtc::sdp::description::media::{MediaDescription, MediaName, RangedPort};
 use webrtc::sdp::description::session::{
-    ATTR_KEY_CONNECTION_SETUP, ATTR_KEY_EXTMAP_ALLOW_MIXED, ATTR_KEY_GROUP, ATTR_KEY_MID,
-    ATTR_KEY_MSID_SEMANTIC, Origin, SessionDescription, TimeDescription,
+    ATTR_KEY_CANDIDATE, ATTR_KEY_CONNECTION_SETUP, ATTR_KEY_EXTMAP_ALLOW_MIXED, ATTR_KEY_GROUP,
+    ATTR_KEY_MID, ATTR_KEY_MSID_SEMANTIC, Origin, SessionDescription, TimeDescription,
 };
 use webrtc::sdp::util::ConnectionRole;
 
@@ -28,6 +30,10 @@ pub struct Description {
     pub ice: RTCIceParameters,
     pub dtls: DTLSParameters,
     pub sctp: SCTPTransportCapabilities,
+
+    /// Candidates embedded in the description. Connections that do not support trickle
+    /// ICE carry every local candidate in the description instead of signaling them.
+    pub candidates: Vec<RTCIceCandidate>,
 }
 
 impl Description {
@@ -82,13 +88,24 @@ impl Description {
                 }),
             }),
             ..Default::default()
-        }
-        .with_ice_credentials(
-            self.ice.username_fragment.clone(),
-            self.ice.password.clone(),
-        )
-        .with_value_attribute("ice-options".to_string(), "trickle".to_string());
+        };
 
+        for (index, candidate) in self.candidates.iter().enumerate() {
+            media = media.with_candidate(format_ice_candidate(
+                index,
+                candidate,
+                &self.ice.username_fragment,
+            ));
+        }
+
+        let media = media
+            .with_ice_credentials(
+                self.ice.username_fragment.clone(),
+                self.ice.password.clone(),
+            )
+            .with_value_attribute("ice-options".to_string(), "trickle".to_string());
+
+        let mut media = media;
         for fingerprint in &self.dtls.fingerprints {
             media =
                 media.with_fingerprint(fingerprint.algorithm.clone(), fingerprint.value.clone());
@@ -142,6 +159,15 @@ impl Description {
             }
         };
 
+        let candidates = session
+            .attributes
+            .iter()
+            .chain(media.attributes.iter())
+            .filter(|attribute| attribute.key == ATTR_KEY_CANDIDATE)
+            .filter_map(|attribute| attribute.value.as_deref())
+            .map(parse_ice_candidate)
+            .collect::<Result<Vec<_>>>()?;
+
         let max_message_size = attribute(media, "max-message-size")?
             .parse::<u32>()
             .map_err(|e| {
@@ -162,6 +188,7 @@ impl Description {
                 }],
             },
             sctp: SCTPTransportCapabilities { max_message_size },
+            candidates,
         })
     }
 }
@@ -204,6 +231,7 @@ mod tests {
             sctp: SCTPTransportCapabilities {
                 max_message_size: 65536,
             },
+            candidates: Vec::new(),
         }
     }
 

@@ -4,6 +4,7 @@ use crate::protocol::Signal;
 use futures::Stream;
 use std::pin::Pin;
 
+pub mod http;
 pub mod lan;
 
 /// Signaling trait for WebRTC signaling
@@ -17,6 +18,15 @@ pub trait Signaling: Send + Sync {
 
     /// Returns the local network ID
     fn network_id(&self) -> String;
+
+    /// Reports whether candidates must be embedded in the session description instead
+    /// of being signaled separately.
+    ///
+    /// Signaling implementations that cannot deliver candidates after the description,
+    /// such as the HTTP endpoints of dedicated servers, return `true`.
+    fn disable_trickle_ice(&self) -> bool {
+        false
+    }
 
     /// Returns the credentials of the ICE servers to gather candidates from.
     ///

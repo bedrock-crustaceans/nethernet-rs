@@ -213,8 +213,20 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             .await
             .map_err(|e| (Some(SignalErrorCode::FailedToCreatePeerConnection), e))?;
 
+        // Non-trickle connections carry every local candidate in the answer itself
+        let disable_trickle_ice = signaling.disable_trickle_ice();
+        let answer_candidates = if disable_trickle_ice {
+            candidates.clone()
+        } else {
+            Vec::new()
+        };
+
         let answer = transports
-            .local_description(ice_parameters.clone(), DTLSRole::Unspecified)
+            .local_description(
+                ice_parameters.clone(),
+                DTLSRole::Unspecified,
+                answer_candidates,
+            )
             .and_then(|description| description.encode())
             .map_err(|e| (Some(SignalErrorCode::FailedToCreateAnswer), e))?;
 
@@ -232,15 +244,17 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             .signal(Signal::answer(connection_id, answer, network_id.clone()))
             .await
             .map_err(|e| (None, e))?;
-        for (index, candidate) in candidates.iter().enumerate() {
-            signaling
-                .signal(Signal::candidate(
-                    connection_id,
-                    format_ice_candidate(index, candidate, &ice_parameters.username_fragment),
-                    network_id.clone(),
-                ))
-                .await
-                .map_err(|e| (None, e))?;
+        if !disable_trickle_ice {
+            for (index, candidate) in candidates.iter().enumerate() {
+                signaling
+                    .signal(Signal::candidate(
+                        connection_id,
+                        format_ice_candidate(index, candidate, &ice_parameters.username_fragment),
+                        network_id.clone(),
+                    ))
+                    .await
+                    .map_err(|e| (None, e))?;
+            }
         }
 
         let mut local = Addr::new(signaling.network_id(), connection_id);
@@ -255,10 +269,21 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         ));
 
         let (candidate_tx, candidate_rx) = oneshot::channel();
+        let candidate_tx = Arc::new(Mutex::new(Some(candidate_tx)));
+
+        for candidate in &description.candidates {
+            if let Err(e) = session.add_remote_candidate(candidate.clone()).await {
+                tracing::warn!("Failed to add remote candidate: {}", e);
+                continue;
+            }
+            if let Some(tx) = candidate_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+        }
+
         let session_clone = session.clone();
         let dispatchers = signal_dispatchers.clone();
         tokio::spawn(async move {
-            let mut candidate_tx = Some(candidate_tx);
             loop {
                 let signal = tokio::select! {
                     _ = session_clone.closed() => break,
@@ -287,7 +312,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                     tracing::warn!("Failed to add remote candidate: {}", e);
                     continue;
                 }
-                if let Some(tx) = candidate_tx.take() {
+                if let Some(tx) = candidate_tx.lock().await.take() {
                     let _ = tx.send(());
                 }
             }

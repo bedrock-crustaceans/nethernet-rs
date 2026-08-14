@@ -132,6 +132,7 @@ impl Transports {
         &self,
         ice: RTCIceParameters,
         role: DTLSRole,
+        candidates: Vec<RTCIceCandidate>,
     ) -> Result<Description> {
         let mut dtls = self.dtls.get_local_parameters()?;
         if dtls.fingerprints.is_empty() {
@@ -147,6 +148,7 @@ impl Transports {
             sctp: SCTPTransportCapabilities {
                 max_message_size: SCTP_MAX_MESSAGE_SIZE,
             },
+            candidates,
         })
     }
 }

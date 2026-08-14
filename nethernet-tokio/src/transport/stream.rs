@@ -150,8 +150,16 @@ impl NethernetStream {
             .await
             .map_err(|e| (Some(SignalErrorCode::FailedToCreatePeerConnection), e))?;
 
+        // Non-trickle connections carry every local candidate in the offer itself
+        let disable_trickle_ice = signaling.disable_trickle_ice();
+        let offer_candidates = if disable_trickle_ice {
+            candidates.clone()
+        } else {
+            Vec::new()
+        };
+
         let offer = transports
-            .local_description(ice_parameters.clone(), DTLSRole::Server)
+            .local_description(ice_parameters.clone(), DTLSRole::Server, offer_candidates)
             .and_then(|description| description.encode())
             .map_err(|e| (Some(SignalErrorCode::FailedToCreateOffer), e))?;
 
@@ -165,15 +173,17 @@ impl NethernetStream {
             ))
             .await
             .map_err(|e| (None, e))?;
-        for (index, candidate) in candidates.iter().enumerate() {
-            signaling
-                .signal(Signal::candidate(
-                    connection_id,
-                    format_ice_candidate(index, candidate, &ice_parameters.username_fragment),
-                    remote_network_id.to_string(),
-                ))
-                .await
-                .map_err(|e| (None, e))?;
+        if !disable_trickle_ice {
+            for (index, candidate) in candidates.iter().enumerate() {
+                signaling
+                    .signal(Signal::candidate(
+                        connection_id,
+                        format_ice_candidate(index, candidate, &ice_parameters.username_fragment),
+                        remote_network_id.to_string(),
+                    ))
+                    .await
+                    .map_err(|e| (None, e))?;
+            }
         }
 
         let mut pending_candidates = Vec::new();
@@ -227,7 +237,12 @@ impl NethernetStream {
         ));
 
         let mut candidate_received = false;
-        for candidate in pending_candidates {
+        for candidate in description
+            .candidates
+            .iter()
+            .cloned()
+            .chain(pending_candidates)
+        {
             if let Err(e) = session.add_remote_candidate(candidate).await {
                 tracing::warn!("Failed to add remote candidate: {}", e);
                 continue;
