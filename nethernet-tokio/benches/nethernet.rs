@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nethernet::protocol::packet::discovery::{
+use nethernet_tokio::protocol::packet::discovery::{
     MessagePacket, RequestPacket, ResponsePacket, marshal, unmarshal,
 };
-use nethernet::protocol::{Message, MessageSegment};
+use nethernet_tokio::protocol::{Message, MessageSegment};
 use std::hint::black_box;
 use std::time::Duration;
 

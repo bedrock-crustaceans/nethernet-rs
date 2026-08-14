@@ -5,8 +5,8 @@
 //! - Accepts incoming WebRTC connections
 //! - Handles packets from clients
 
-use nethernet::signaling::lan::LanSignaling;
-use nethernet::{NethernetListener, ServerData, Signaling};
+use nethernet_tokio::signaling::lan::LanSignaling;
+use nethernet_tokio::{NethernetListener, ServerData, Signaling};
 use std::net::SocketAddr;
 use tracing::Level;
 use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt};

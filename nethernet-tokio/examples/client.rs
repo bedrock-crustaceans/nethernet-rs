@@ -5,8 +5,8 @@
 //! - Connects via WebRTC
 //! - Sends and receives packets
 
-use nethernet::NethernetStream;
-use nethernet::signaling::lan::LanSignaling;
+use nethernet_tokio::NethernetStream;
+use nethernet_tokio::signaling::lan::LanSignaling;
 use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
