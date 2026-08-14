@@ -23,5 +23,6 @@ pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePack
 pub use protocol::{ConnectError, Message, MessageSegment, Signal, SignalType};
 pub use session::Session;
 pub use signaling::Signaling;
+pub use signaling::http::HttpSignaling;
 pub use signaling::lan::{LanConfig, LanSignaling};
 pub use transport::{ConnectionConfig, NethernetListener, NethernetStream, Timeouts};
