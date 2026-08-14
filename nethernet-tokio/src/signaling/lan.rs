@@ -117,6 +117,11 @@ impl LanSignaling {
         }
     }
 
+    /// Sets the server data advertised in response to discovery requests.
+    pub fn set_server_data(&self, server_data: ServerData) {
+        *self.server_data.write().unwrap_or_else(|e| e.into_inner()) = Some(server_data);
+    }
+
     /// Returns a snapshot of discovered servers keyed by their network ID.
     ///
     /// Clones and returns the current internal map of discovered `ServerData` entries.
@@ -424,9 +429,11 @@ impl Signaling for LanSignaling {
         self.network_id.to_string()
     }
 
-    /// Update the stored server "pong" data from marshalled bytes.
-    fn set_pong_data(&self, data: Vec<u8>) {
-        *self.server_data.write().unwrap_or_else(|e| e.into_inner()) =
-            ServerData::unmarshal(&data).ok();
+    /// Update the stored server data from a RakNet pong response.
+    fn set_pong_data(&self, data: &[u8]) {
+        match ServerData::from_pong_data(data) {
+            Ok(server_data) => self.set_server_data(server_data),
+            Err(e) => tracing::error!("Failed to parse pong data: {}", e),
+        }
     }
 }

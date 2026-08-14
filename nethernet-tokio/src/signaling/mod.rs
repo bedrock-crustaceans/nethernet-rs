@@ -26,6 +26,9 @@ pub trait Signaling: Send + Sync {
         async { Ok(None) }
     }
 
-    /// Sets pong data (for LAN discovery)
-    fn set_pong_data(&self, data: Vec<u8>);
+    /// Sets the server data advertised to clients from a RakNet pong response.
+    ///
+    /// The pong is the `;` separated response Minecraft listeners send to unconnected
+    /// pings, which is parsed into the server data of LAN discovery responses.
+    fn set_pong_data(&self, data: &[u8]);
 }
