@@ -5,6 +5,7 @@ use crate::protocol::{Message, MessageSegment};
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::RTCDtlsTransport;
@@ -26,6 +27,7 @@ pub struct Session {
     packet_tx: mpsc::Sender<Bytes>,
     packet_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
     closed: Arc<RwLock<bool>>,
+    close_token: CancellationToken,
 }
 
 impl Session {
@@ -73,6 +75,7 @@ impl Session {
             packet_tx,
             packet_rx: Arc::new(Mutex::new(packet_rx)),
             closed: Arc::new(RwLock::new(false)),
+            close_token: CancellationToken::new(),
         }
     }
 
@@ -192,6 +195,8 @@ impl Session {
         *closed = true;
         drop(closed);
 
+        self.close_token.cancel();
+
         // Acquire lock, clone the channel, drop the lock, then close
         let reliable = self.reliable_channel.lock().await.clone();
         if let Some(channel) = reliable {
@@ -262,6 +267,11 @@ impl Session {
     /// Gets a clone of the session's ICE transport.
     pub fn ice_transport(&self) -> Arc<RTCIceTransport> {
         self.ice.clone()
+    }
+
+    /// Resolves once the session has been closed.
+    pub async fn closed(&self) {
+        self.close_token.cancelled().await
     }
 
     /// Reports whether the session has been closed.

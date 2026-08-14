@@ -232,7 +232,20 @@ impl NethernetStream {
         let remote_network_id = remote_network_id.to_string();
         tokio::spawn(async move {
             let mut candidate_tx = Some(candidate_tx);
-            while let Some(signal) = signals.next().await {
+            loop {
+                let signal = tokio::select! {
+                    _ = session_clone.closed() => break,
+                    signal = signals.next() => match signal {
+                        Some(signal) => signal,
+                        None => break,
+                    },
+                };
+                if signal.signal_type == SignalType::Error {
+                    let code = parse_error_code(&signal.data);
+                    tracing::debug!("Remote connection signaled an error: {:?}", code);
+                    let _ = session_clone.close().await;
+                    break;
+                }
                 if signal.connection_id != connection_id
                     || signal.network_id != remote_network_id
                     || signal.signal_type != SignalType::Candidate

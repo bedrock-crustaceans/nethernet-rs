@@ -71,6 +71,7 @@ type SignalDispatchers = Arc<Mutex<HashMap<ConnectionKey, mpsc::UnboundedSender<
 pub struct NethernetListener<S: Signaling> {
     incoming: mpsc::UnboundedReceiver<Arc<Session>>,
     local_addr: Addr,
+    signal_dispatchers: SignalDispatchers,
     cancel_token: CancellationToken,
     _signal_handler_task: JoinHandle<()>,
     _phantom: PhantomData<S>,
@@ -92,13 +93,14 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let signal_handler_task = Self::start_signal_handler(
             signaling,
             incoming_tx,
-            signal_dispatchers,
+            signal_dispatchers.clone(),
             cancel_token.clone(),
         );
 
         let listener = Self {
             incoming: incoming_rx,
             local_addr,
+            signal_dispatchers,
             cancel_token,
             _signal_handler_task: signal_handler_task,
             _phantom: PhantomData,
@@ -245,7 +247,14 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let dispatchers = signal_dispatchers.clone();
         tokio::spawn(async move {
             let mut candidate_tx = Some(candidate_tx);
-            while let Some(signal) = signal_rx.recv().await {
+            loop {
+                let signal = tokio::select! {
+                    _ = session_clone.closed() => break,
+                    signal = signal_rx.recv() => match signal {
+                        Some(signal) => signal,
+                        None => break,
+                    },
+                };
                 if signal.signal_type == SignalType::Error {
                     let code = parse_error_code(&signal.data);
                     tracing::debug!("Remote connection signaled an error: {:?}", code);
@@ -369,6 +378,24 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             .recv()
             .await
             .ok_or_else(|| NethernetError::ConnectionClosed)
+    }
+
+    /// Closes the listener and every session that has not been accepted yet.
+    ///
+    /// Blocked calls to [`NethernetListener::accept`] return
+    /// [`NethernetError::ConnectionClosed`] once the listener is closed.
+    pub async fn close(&mut self) -> Result<()> {
+        self.cancel_token.cancel();
+        self.incoming.close();
+
+        while let Ok(session) = self.incoming.try_recv() {
+            if let Err(e) = session.close().await {
+                tracing::debug!("Failed to close pending session: {}", e);
+            }
+        }
+        self.signal_dispatchers.lock().await.clear();
+
+        Ok(())
     }
 
     /// Address of the local network this listener accepts connections on.
