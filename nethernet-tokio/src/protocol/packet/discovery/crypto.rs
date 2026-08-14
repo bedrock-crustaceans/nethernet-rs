@@ -13,6 +13,9 @@ use std::sync::LazyLock;
 /// The encryption key used for packets transmitted during LAN discovery.
 /// This is the SHA-256 hash of 0xdeadbeef (also referenced as Application ID).
 /// Computed once and cached for all subsequent calls.
+/// AES block size in bytes.
+const BLOCK_SIZE: usize = 16;
+
 static ENCRYPTION_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     let mut hasher = Sha256::new();
     hasher.update(0xdeadbeef_u64.to_le_bytes());
@@ -40,19 +43,11 @@ static HMAC_STATE: LazyLock<Hmac<Sha256>> = LazyLock::new(|| {
 /// The buffer is resized to include PKCS#7 padding (multiple of 16 bytes) before encryption.
 pub(crate) fn encrypt(buf: &mut Vec<u8>) -> Result<()> {
     // Apply PKCS7 padding
-    let block_size = 16;
     let data_len = buf.len();
-    let padding_len = block_size - (data_len % block_size);
+    let padding_len = BLOCK_SIZE - (data_len % BLOCK_SIZE);
     buf.resize(data_len + padding_len, padding_len as u8);
 
-    // Encrypt blocks in-place
-    // Safety: GenericArray/Block is repr(transparent) over [u8; 16]
-    let blocks = unsafe {
-        std::slice::from_raw_parts_mut(
-            buf.as_mut_ptr() as *mut Block<Aes256>,
-            buf.len() / block_size,
-        )
-    };
+    let (blocks, _) = Block::<Aes256>::slice_as_chunks_mut(buf.as_mut_slice());
     CIPHER.encrypt_blocks(blocks);
 
     Ok(())
@@ -62,35 +57,30 @@ pub(crate) fn encrypt(buf: &mut Vec<u8>) -> Result<()> {
 ///
 /// Returns an error if the input length is zero or not a multiple of 16, or if PKCS#7 padding is invalid.
 pub(crate) fn decrypt(buf: &mut Vec<u8>) -> Result<()> {
-    if buf.is_empty() || buf.len() % 16 != 0 {
+    if buf.is_empty() || !buf.len().is_multiple_of(BLOCK_SIZE) {
         return Err(NethernetError::Other(
             "Invalid encrypted data length".to_string(),
         ));
     }
 
-    // Decrypt blocks in-place
-    // Safety: GenericArray/Block is repr(transparent) over [u8; 16]
-    let blocks = unsafe {
-        std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut Block<Aes256>, buf.len() / 16)
-    };
+    let (blocks, _) = Block::<Aes256>::slice_as_chunks_mut(buf.as_mut_slice());
     CIPHER.decrypt_blocks(blocks);
 
     // Remove PKCS7 padding
-    if let Some(&padding_len) = buf.last() {
-        if padding_len > 0 && padding_len <= 16 {
-            let data_len = buf.len();
-            if data_len >= padding_len as usize {
-                // Verify padding (constant-time)
-                let padding_start = data_len - padding_len as usize;
-                let mut mismatched: u8 = 0;
-                for &byte in &buf[padding_start..] {
-                    mismatched |= byte ^ padding_len;
-                }
-                if mismatched == 0 {
-                    buf.truncate(padding_start);
-                    return Ok(());
-                }
-            }
+    let data_len = buf.len();
+    if let Some(&padding_len) = buf.last()
+        && padding_len > 0
+        && padding_len as usize <= BLOCK_SIZE.min(data_len)
+    {
+        // Verify padding (constant-time)
+        let padding_start = data_len - padding_len as usize;
+        let mut mismatched: u8 = 0;
+        for &byte in &buf[padding_start..] {
+            mismatched |= byte ^ padding_len;
+        }
+        if mismatched == 0 {
+            buf.truncate(padding_start);
+            return Ok(());
         }
     }
 
