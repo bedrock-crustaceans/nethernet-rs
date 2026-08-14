@@ -1,4 +1,5 @@
 use crate::error::{NethernetError, Result};
+use crate::protocol::webrtc::format_ice_candidate;
 use crate::protocol::{
     Signal, SignalType,
     constants::{RELIABLE_CHANNEL, UNRELIABLE_CHANNEL},
@@ -11,6 +12,7 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -18,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 
 /// NetherNet listener - accepts WebRTC connections
@@ -121,7 +124,10 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let media_engine = MediaEngine::default();
 
         // Configure SettingEngine to avoid IPv6 link-local binding issues
-        let setting_engine = SettingEngine::default();
+        let mut setting_engine = SettingEngine::default();
+
+        let (ufrag, pwd) = super::generate_ice_credentials();
+        setting_engine.set_ice_credentials(ufrag.clone(), pwd);
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -139,20 +145,22 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let signaling_clone = signaling.clone();
         let network_id_clone = signal.network_id.clone();
         let connection_id = signal.connection_id;
+        let candidate_index = Arc::new(AtomicUsize::new(0));
         peer_connection.on_ice_candidate(Box::new(
             move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
                 let signaling = signaling_clone.clone();
                 let network_id = network_id_clone.clone();
+                let index = candidate_index.clone();
+                let ufrag = ufrag.clone();
                 Box::pin(async move {
                     if let Some(candidate) = candidate {
-                        if let Ok(json) = candidate.to_json() {
-                            // Serialize full RTCIceCandidateInit (includes candidate, sdp_mid, sdp_mline_index)
-                            if let Ok(candidate_json) = serde_json::to_string(&json) {
-                                let candidate_signal =
-                                    Signal::candidate(connection_id, candidate_json, network_id);
-                                let _ = signaling.signal(candidate_signal).await;
-                            }
-                        }
+                        let index = index.fetch_add(1, Ordering::Relaxed);
+                        let candidate_signal = Signal::candidate(
+                            connection_id,
+                            format_ice_candidate(index, &candidate, &ufrag),
+                            network_id,
+                        );
+                        let _ = signaling.signal(candidate_signal).await;
                     }
                 })
             },
@@ -183,18 +191,9 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             let mut first_candidate = true;
             while let Some(sig) = signal_rx.recv().await {
                 if sig.signal_type == SignalType::Candidate {
-                    // Deserialize sig.data into an RTCIceCandidateInit
-                    let candidate_init = match serde_json::from_str::<
-                        webrtc::ice_transport::ice_candidate::RTCIceCandidateInit,
-                    >(&sig.data)
-                    {
-                        Ok(init) => init,
-                        Err(_) => webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
-                            candidate: sig.data.clone(),
-                            sdp_mid: None,
-                            sdp_mline_index: None,
-                            username_fragment: None,
-                        },
+                    let candidate_init = RTCIceCandidateInit {
+                        candidate: sig.data.clone(),
+                        ..Default::default()
                     };
 
                     if let Err(e) = peer_connection_clone

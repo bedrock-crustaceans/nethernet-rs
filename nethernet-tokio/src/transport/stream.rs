@@ -1,4 +1,5 @@
 use crate::error::{NethernetError, Result};
+use crate::protocol::webrtc::format_ice_candidate;
 use crate::protocol::{
     Signal, SignalType,
     constants::{RELIABLE_CHANNEL, UNRELIABLE_CHANNEL},
@@ -12,6 +13,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::io::StreamReader;
@@ -20,6 +22,7 @@ use webrtc::api::APIBuilder;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice::network_type::NetworkType;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 
@@ -80,6 +83,9 @@ impl NethernetStream {
         // Configure SettingEngine to avoid IPv6 link-local binding issues
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_network_types(vec![NetworkType::Udp4]);
+
+        let (ufrag, pwd) = super::generate_ice_credentials();
+        setting_engine.set_ice_credentials(ufrag.clone(), pwd);
 
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -151,20 +157,22 @@ impl NethernetStream {
         // Set up ICE candidate handler to signal candidates
         let signaling_clone = signaling.clone();
         let remote_network_id_clone = remote_network_id.clone();
+        let candidate_index = Arc::new(AtomicUsize::new(0));
         peer_connection.on_ice_candidate(Box::new(
             move |candidate: Option<webrtc::ice_transport::ice_candidate::RTCIceCandidate>| {
                 let signaling = signaling_clone.clone();
                 let network_id = remote_network_id_clone.clone();
+                let index = candidate_index.clone();
+                let ufrag = ufrag.clone();
                 Box::pin(async move {
                     if let Some(candidate) = candidate {
-                        if let Ok(json) = candidate.to_json() {
-                            // Serialize full RTCIceCandidateInit (includes candidate, sdp_mid, sdp_mline_index)
-                            if let Ok(candidate_json) = serde_json::to_string(&json) {
-                                let candidate_signal =
-                                    Signal::candidate(connection_id, candidate_json, network_id);
-                                let _ = signaling.signal(candidate_signal).await;
-                            }
-                        }
+                        let index = index.fetch_add(1, Ordering::Relaxed);
+                        let candidate_signal = Signal::candidate(
+                            connection_id,
+                            format_ice_candidate(index, &candidate, &ufrag),
+                            network_id,
+                        );
+                        let _ = signaling.signal(candidate_signal).await;
                     }
                 })
             },
@@ -193,21 +201,10 @@ impl NethernetStream {
                         }
                         SignalType::Candidate => {
                             // Buffer remote ICE candidates until after set_remote_description
-                            let candidate_init = match serde_json::from_str::<
-                                webrtc::ice_transport::ice_candidate::RTCIceCandidateInit,
-                            >(&signal.data)
-                            {
-                                Ok(init) => init,
-                                Err(_) => {
-                                    webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
-                                        candidate: signal.data.clone(),
-                                        sdp_mid: None,
-                                        sdp_mline_index: None,
-                                        username_fragment: None,
-                                    }
-                                }
-                            };
-                            pending_candidates.push(candidate_init);
+                            pending_candidates.push(RTCIceCandidateInit {
+                                candidate: signal.data.clone(),
+                                ..Default::default()
+                            });
                         }
                         _ => {}
                     }
@@ -250,20 +247,9 @@ impl NethernetStream {
                             if signal.connection_id == connection_id
                                 && signal.signal_type == SignalType::Candidate
                             {
-                                let candidate_init = match serde_json::from_str::<
-                                    webrtc::ice_transport::ice_candidate::RTCIceCandidateInit,
-                                >(&signal.data)
-                                {
-                                    Ok(init) => init,
-                                    Err(_) => {
-                                        tracing::debug!("Failed to parse candidate as JSON, treating as raw string");
-                                        webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
-                                            candidate: signal.data.clone(),
-                                            sdp_mid: None,
-                                            sdp_mline_index: None,
-                                            username_fragment: None,
-                                        }
-                                    }
+                                let candidate_init = RTCIceCandidateInit {
+                                    candidate: signal.data.clone(),
+                                    ..Default::default()
                                 };
                                 tracing::debug!("Received ICE candidate: {}", candidate_init.candidate);
                                 if let Err(e) = peer_connection_clone
