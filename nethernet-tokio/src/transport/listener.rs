@@ -1,3 +1,4 @@
+use crate::addr::Addr;
 use crate::error::{NethernetError, Result};
 use crate::protocol::constants::{RELIABLE_CHANNEL, SCTP_PORT, UNRELIABLE_CHANNEL};
 use crate::protocol::webrtc::{Description, format_ice_candidate, parse_ice_candidate};
@@ -8,7 +9,6 @@ use crate::transport::Transports;
 use futures::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -38,19 +38,20 @@ type SignalDispatchers = Arc<Mutex<HashMap<ConnectionKey, mpsc::UnboundedSender<
 /// NetherNet listener - accepts WebRTC connections
 pub struct NethernetListener<S: Signaling> {
     incoming: mpsc::UnboundedReceiver<Arc<Session>>,
-    local_addr: SocketAddr,
+    local_addr: Addr,
     cancel_token: CancellationToken,
     _signal_handler_task: JoinHandle<()>,
     _phantom: PhantomData<S>,
 }
 
 impl<S: Signaling + 'static> NethernetListener<S> {
-    /// Create a new [`NethernetListener`] bound to the given local address using the provided signaling implementation.
+    /// Create a new [`NethernetListener`] on the local network of the signaling implementation.
     ///
     /// The returned listener is ready to accept inbound WebRTC sessions. It initializes internal queues and dispatch
     /// structures, and spawns a background task to process signaling events; dropping the listener cancels that task.
-    pub async fn bind(signaling: S, local_addr: SocketAddr) -> Result<Self> {
+    pub async fn bind(signaling: S) -> Result<Self> {
         let signaling = Arc::new(signaling);
+        let local_addr = Addr::network(signaling.network_id());
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let signal_dispatchers = Arc::new(Mutex::new(HashMap::new()));
         let cancel_token = CancellationToken::new();
@@ -162,8 +163,19 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                 .await?;
         }
 
+        let mut local = Addr::new(signaling.network_id(), connection_id);
+        local.candidates = candidates;
+
+        let session = Arc::new(Session::new(
+            transports.ice.clone(),
+            transports.dtls.clone(),
+            transports.sctp.clone(),
+            local,
+            Addr::new(network_id, connection_id),
+        ));
+
         let (candidate_tx, candidate_rx) = oneshot::channel();
-        let ice = transports.ice.clone();
+        let session_clone = session.clone();
         let dispatchers = signal_dispatchers.clone();
         tokio::spawn(async move {
             let mut candidate_tx = Some(candidate_tx);
@@ -178,7 +190,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
                         continue;
                     }
                 };
-                if let Err(e) = ice.add_remote_candidate(Some(candidate)).await {
+                if let Err(e) = session_clone.add_remote_candidate(candidate).await {
                     tracing::warn!("Failed to add remote candidate: {}", e);
                     continue;
                 }
@@ -192,7 +204,8 @@ impl<S: Signaling + 'static> NethernetListener<S> {
         let incoming_tx = incoming_tx.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                Self::start_transports(transports, description, candidate_rx, incoming_tx).await
+                Self::start_transports(transports, session, description, candidate_rx, incoming_tx)
+                    .await
             {
                 tracing::debug!("Failed to establish incoming connection: {}", e);
             }
@@ -205,6 +218,7 @@ impl<S: Signaling + 'static> NethernetListener<S> {
     /// remote connection has created both data channels.
     async fn start_transports(
         transports: Transports,
+        session: Arc<Session>,
         description: Description,
         candidate_rx: oneshot::Receiver<()>,
         incoming_tx: mpsc::UnboundedSender<Arc<Session>>,
@@ -214,12 +228,6 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             .map_err(|_| NethernetError::Timeout)?
             .map_err(|_| NethernetError::ConnectionClosed)?;
         tracing::debug!("Received first candidate");
-
-        let session = Arc::new(Session::new(
-            transports.ice.clone(),
-            transports.dtls.clone(),
-            transports.sctp.clone(),
-        ));
 
         let (opened_tx, opened_rx) = oneshot::channel();
         let opened_tx = Arc::new(Mutex::new(Some(opened_tx)));
@@ -285,9 +293,9 @@ impl<S: Signaling + 'static> NethernetListener<S> {
             .ok_or_else(|| NethernetError::ConnectionClosed)
     }
 
-    /// Local socket address that this listener is bound to.
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+    /// Address of the local network this listener accepts connections on.
+    pub fn local_addr(&self) -> &Addr {
+        &self.local_addr
     }
 }
 

@@ -64,32 +64,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("🎯 Found server with network ID: {}", server_network_id);
     tracing::debug!("   Server data: {:?}", server_data);
 
-    // Get the actual server address from the signaling layer
-    let server_addr = signaling
-        .get_address(*server_network_id)
-        .await
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Address not found for network ID {}", server_network_id),
-            )
-        })?;
-
-    tracing::info!(
-        "🔗 Connecting to server at {} (network ID: {})",
-        server_addr,
-        server_network_id
-    );
+    tracing::info!("🔗 Connecting to network ID: {}", server_network_id);
 
     // Connect to the server using discovered network ID
-    let mut stream = NethernetStream::connect(
-        signaling.clone(),
-        server_network_id.to_string(),
-        server_addr,
-    )
-    .await?;
+    let mut stream =
+        NethernetStream::connect(signaling.clone(), server_network_id.to_string()).await?;
 
-    tracing::info!("✅ Connected to server");
+    tracing::info!("✅ Connected to {}", stream.remote_addr().await);
 
     // Send some test packets
     for i in 1..=10 {

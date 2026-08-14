@@ -1,3 +1,4 @@
+use crate::addr::Addr;
 use crate::error::{NethernetError, Result};
 use crate::protocol::constants::DEFAULT_PACKET_CHANNEL_CAPACITY;
 use crate::protocol::{Message, MessageSegment};
@@ -8,6 +9,7 @@ use tracing;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::RTCDtlsTransport;
 use webrtc::ice_transport::RTCIceTransport;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_transport_state::RTCIceTransportState;
 use webrtc::sctp_transport::RTCSctpTransport;
 
@@ -16,6 +18,8 @@ pub struct Session {
     ice: Arc<RTCIceTransport>,
     dtls: Arc<RTCDtlsTransport>,
     sctp: Arc<RTCSctpTransport>,
+    local: Addr,
+    remote: Arc<Mutex<Addr>>,
     reliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     unreliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     message_buffer: Arc<Mutex<Message>>,
@@ -26,12 +30,24 @@ pub struct Session {
 
 impl Session {
     /// Creates a Session using the default packet channel capacity.
+    ///
+    /// The local address holds the locally gathered candidates, while the remote address
+    /// is extended with the candidates signaled by the remote connection.
     pub fn new(
         ice: Arc<RTCIceTransport>,
         dtls: Arc<RTCDtlsTransport>,
         sctp: Arc<RTCSctpTransport>,
+        local: Addr,
+        remote: Addr,
     ) -> Self {
-        Self::with_capacity(ice, dtls, sctp, DEFAULT_PACKET_CHANNEL_CAPACITY)
+        Self::with_capacity(
+            ice,
+            dtls,
+            sctp,
+            local,
+            remote,
+            DEFAULT_PACKET_CHANNEL_CAPACITY,
+        )
     }
 
     /// Creates a Session backed by the given transports and a bounded packet channel with the specified capacity.
@@ -39,6 +55,8 @@ impl Session {
         ice: Arc<RTCIceTransport>,
         dtls: Arc<RTCDtlsTransport>,
         sctp: Arc<RTCSctpTransport>,
+        local: Addr,
+        remote: Addr,
         capacity: usize,
     ) -> Self {
         let (packet_tx, packet_rx) = mpsc::channel(capacity);
@@ -47,6 +65,8 @@ impl Session {
             ice,
             dtls,
             sctp,
+            local,
+            remote: Arc::new(Mutex::new(remote)),
             reliable_channel: Arc::new(Mutex::new(None)),
             unreliable_channel: Arc::new(Mutex::new(None)),
             message_buffer: Arc::new(Mutex::new(Message::new())),
@@ -198,6 +218,40 @@ impl Session {
             Some(e) => Err(NethernetError::WebRtc(e)),
             None => Ok(()),
         }
+    }
+
+    /// Adds a candidate signaled by the remote connection to the ICE transport and
+    /// records it in the remote address of the session.
+    pub async fn add_remote_candidate(&self, candidate: RTCIceCandidate) -> Result<()> {
+        self.ice
+            .add_remote_candidate(Some(candidate.clone()))
+            .await?;
+        self.remote.lock().await.candidates.push(candidate);
+        Ok(())
+    }
+
+    /// Returns the local address of the session, including the candidate selected by
+    /// the ICE transport if a pair has been selected.
+    pub async fn local_addr(&self) -> Addr {
+        let mut addr = self.local.clone();
+        addr.selected_candidate = self
+            .ice
+            .get_selected_candidate_pair()
+            .await
+            .map(|pair| pair.local);
+        addr
+    }
+
+    /// Returns the address of the remote connection, including the candidates it has
+    /// signaled and the candidate selected by the ICE transport.
+    pub async fn remote_addr(&self) -> Addr {
+        let mut addr = self.remote.lock().await.clone();
+        addr.selected_candidate = self
+            .ice
+            .get_selected_candidate_pair()
+            .await
+            .map(|pair| pair.remote);
+        addr
     }
 
     /// Returns the current state of the ICE transport.

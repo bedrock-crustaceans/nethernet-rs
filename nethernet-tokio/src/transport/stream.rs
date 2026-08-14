@@ -1,3 +1,4 @@
+use crate::addr::Addr;
 use crate::error::{NethernetError, Result};
 use crate::protocol::constants::{RELIABLE_CHANNEL, SCTP_PORT, UNRELIABLE_CHANNEL};
 use crate::protocol::webrtc::{Description, format_ice_candidate, parse_ice_candidate};
@@ -9,7 +10,6 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use rand::Rng;
 use std::io;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -61,7 +61,6 @@ impl Stream for SessionStream {
 /// NetherNet stream - data transmission over WebRTC
 pub struct NethernetStream {
     session: Arc<Session>,
-    remote_addr: SocketAddr,
     reader: StreamReader<SessionStream, Bytes>,
     send_future: Option<ReusableBoxFuture<'static, Result<()>>>,
     shutdown_future: Option<ReusableBoxFuture<'static, Result<()>>>,
@@ -76,7 +75,6 @@ impl NethernetStream {
     pub async fn connect<S: Signaling + 'static>(
         signaling: Arc<S>,
         remote_network_id: String,
-        remote_addr: SocketAddr,
     ) -> Result<Self> {
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_network_types(vec![NetworkType::Udp4]);
@@ -136,9 +134,20 @@ impl NethernetStream {
 
         let description = Description::parse(&answer)?;
 
+        let mut local = Addr::new(signaling.network_id(), connection_id);
+        local.candidates = candidates;
+
+        let session = Arc::new(Session::new(
+            transports.ice.clone(),
+            transports.dtls.clone(),
+            transports.sctp.clone(),
+            local,
+            Addr::new(remote_network_id.clone(), connection_id),
+        ));
+
         let mut candidate_received = false;
         for candidate in pending_candidates {
-            if let Err(e) = transports.ice.add_remote_candidate(Some(candidate)).await {
+            if let Err(e) = session.add_remote_candidate(candidate).await {
                 tracing::warn!("Failed to add remote candidate: {}", e);
                 continue;
             }
@@ -146,7 +155,7 @@ impl NethernetStream {
         }
 
         let (candidate_tx, candidate_rx) = oneshot::channel();
-        let ice = transports.ice.clone();
+        let session_clone = session.clone();
         tokio::spawn(async move {
             let mut candidate_tx = Some(candidate_tx);
             while let Some(signal) = signals.next().await {
@@ -163,7 +172,7 @@ impl NethernetStream {
                         continue;
                     }
                 };
-                if let Err(e) = ice.add_remote_candidate(Some(candidate)).await {
+                if let Err(e) = session_clone.add_remote_candidate(candidate).await {
                     tracing::warn!("Failed to add remote candidate: {}", e);
                     continue;
                 }
@@ -231,19 +240,14 @@ impl NethernetStream {
                 .await?,
         );
 
-        let session = Arc::new(Session::new(
-            transports.ice.clone(),
-            transports.dtls.clone(),
-            transports.sctp.clone(),
-        ));
         session.set_reliable_channel(reliable).await?;
         session.set_unreliable_channel(unreliable).await?;
 
-        Ok(Self::from_session(session, remote_addr))
+        Ok(Self::from_session(session))
     }
 
-    /// Constructs a NethernetStream from an existing Session and the peer's socket address.
-    pub fn from_session(session: Arc<Session>, remote_addr: SocketAddr) -> Self {
+    /// Constructs a NethernetStream from an existing Session.
+    pub fn from_session(session: Arc<Session>) -> Self {
         let session_clone = session.clone();
         let recv_future = ReusableBoxFuture::new(async move { session_clone.recv().await });
 
@@ -254,7 +258,6 @@ impl NethernetStream {
 
         Self {
             session,
-            remote_addr,
             reader: StreamReader::new(stream),
             send_future: None,
             shutdown_future: None,
@@ -276,9 +279,14 @@ impl NethernetStream {
         self.session.close().await
     }
 
-    /// Get the socket address of the remote endpoint for this stream.
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
+    /// Get the address of the remote endpoint for this stream.
+    pub async fn remote_addr(&self) -> Addr {
+        self.session.remote_addr().await
+    }
+
+    /// Get the local address of this stream.
+    pub async fn local_addr(&self) -> Addr {
+        self.session.local_addr().await
     }
 
     /// Access the underlying session.

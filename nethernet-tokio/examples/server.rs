@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("   Broadcasting discovery responses...");
 
     // Create listener
-    let mut listener = NethernetListener::bind(signaling, bind_addr).await?;
+    let mut listener = NethernetListener::bind(signaling).await?;
     tracing::info!("✅ Server ready and responding to LAN discovery");
 
     // Accept incoming connections
