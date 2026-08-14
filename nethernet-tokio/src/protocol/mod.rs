@@ -7,4 +7,4 @@ pub mod webrtc;
 
 pub use message::{Message, MessageSegment};
 pub use signal::{Signal, SignalType};
-pub use webrtc::{ConnectError, NegotiationMessage};
+pub use webrtc::ConnectError;
