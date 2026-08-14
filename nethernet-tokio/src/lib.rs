@@ -18,5 +18,5 @@ pub use error::{NethernetError, Result};
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{ConnectError, Message, MessageSegment, NegotiationMessage, Signal, SignalType};
 pub use session::Session;
-pub use signaling::{Notifier, Signaling};
+pub use signaling::Signaling;
 pub use transport::{NethernetListener, NethernetStream};

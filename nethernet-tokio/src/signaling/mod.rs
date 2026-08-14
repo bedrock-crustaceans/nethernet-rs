@@ -20,12 +20,3 @@ pub trait Signaling: Send + Sync {
     /// Sets pong data (for LAN discovery)
     fn set_pong_data(&self, data: Vec<u8>);
 }
-
-/// Notifier trait - for signal and error notifications
-pub trait Notifier: Send + Sync {
-    /// Notifies a new signal
-    fn notify_signal(&self, signal: Signal);
-
-    /// Notifies an error
-    fn notify_error(&self, error: crate::error::NethernetError);
-}
