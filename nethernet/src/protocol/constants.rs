@@ -13,6 +13,9 @@ pub const ID_MESSAGE_PACKET: u16 = 2;
 /// 16 MB is a reasonable upper limit for most protocol use cases.
 pub const MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MB
 
+/// Maximum size of a single data-channel message fragment.
+pub const MAX_MESSAGE_SIZE: usize = 10000;
+
 /// Interval on which discovery request broadcasts should be (re-)sent.
 pub const BROADCAST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
