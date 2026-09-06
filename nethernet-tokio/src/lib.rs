@@ -8,12 +8,14 @@
 
 pub mod addr;
 pub mod builders;
+pub mod connection;
 pub mod credentials;
 pub mod error;
 pub mod http;
 pub mod lan;
 mod net;
 pub mod protocol;
+pub mod router;
 pub mod session;
 pub mod signaling;
 pub mod transport;
