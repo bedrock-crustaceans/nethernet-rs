@@ -8,6 +8,7 @@
 
 pub mod addr;
 pub mod builders;
+pub mod credentials;
 pub mod error;
 pub mod protocol;
 pub mod session;
@@ -16,9 +17,12 @@ pub mod transport;
 
 pub use addr::Addr;
 pub use builders::*;
+pub use credentials::{Credentials, IceServer};
 pub use error::{NethernetError, Result};
 pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
 pub use protocol::{ConnectError, Message, MessageSegment, Signal, SignalType};
 pub use session::Session;
 pub use signaling::Signaling;
-pub use transport::{NethernetListener, NethernetStream};
+pub use signaling::http::HttpSignaling;
+pub use signaling::lan::{LanConfig, LanSignaling};
+pub use transport::{ConnectionConfig, NethernetListener, NethernetStream, Timeouts};

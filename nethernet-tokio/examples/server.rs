@@ -6,7 +6,7 @@
 //! - Handles packets from clients
 
 use nethernet_tokio::signaling::lan::LanSignaling;
-use nethernet_tokio::{NethernetListener, ServerData, Signaling};
+use nethernet_tokio::{NethernetListener, ServerData};
 use std::net::SocketAddr;
 use tracing::Level;
 use tracing_subscriber::{filter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signaling = LanSignaling::new(network_id, bind_addr).await?;
 
     // Set server data for discovery responses
-    signaling.set_pong_data(server_data.marshal()?);
+    signaling.set_server_data(server_data);
 
     tracing::info!("NetherNet server starting");
     tracing::info!("   Network ID: {}", network_id);

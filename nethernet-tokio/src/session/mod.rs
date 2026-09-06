@@ -5,6 +5,7 @@ use crate::protocol::{Message, MessageSegment};
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::RTCDtlsTransport;
@@ -12,6 +13,59 @@ use webrtc::ice_transport::RTCIceTransport;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
 use webrtc::ice_transport::ice_transport_state::RTCIceTransportState;
 use webrtc::sctp_transport::RTCSctpTransport;
+
+/// Routes the message segments received on the channel into the buffer, forwarding
+/// each reassembled message to the receiver.
+fn attach_message_handler(
+    channel: &Arc<RTCDataChannel>,
+    buffer: Arc<Mutex<Message>>,
+    tx: mpsc::Sender<Bytes>,
+) {
+    channel.on_message(Box::new(move |msg| {
+        let data = msg.data.clone();
+        let buffer = buffer.clone();
+        let tx = tx.clone();
+
+        Box::pin(async move {
+            let data_len = data.len();
+            match MessageSegment::decode(data.clone()) {
+                Ok(segment) => {
+                    let result = {
+                        let mut buf = buffer.lock().await;
+                        buf.add_segment(segment)
+                    };
+                    match result {
+                        Ok(Some(complete_msg)) => {
+                            // Use async send to handle backpressure with bounded channel
+                            // If send fails, it means the receiver has been dropped
+                            let _ = tx.send(complete_msg).await;
+                        }
+                        Ok(None) => {
+                            tracing::debug!(
+                                "incomplete segment added to buffer, waiting for more segments"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to add segment to buffer: {:?}, data length: {}",
+                                e,
+                                data_len
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "failed to decode message segment: {:?}, data length: {}, data preview: {:?}",
+                        e,
+                        data_len,
+                        &data.as_ref()[..data_len.min(64)]
+                    );
+                }
+            }
+        })
+    }));
+}
 
 /// WebRTC session manager
 pub struct Session {
@@ -23,9 +77,13 @@ pub struct Session {
     reliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     unreliable_channel: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     message_buffer: Arc<Mutex<Message>>,
+    unreliable_buffer: Arc<Mutex<Message>>,
     packet_tx: mpsc::Sender<Bytes>,
     packet_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    unreliable_tx: mpsc::Sender<Bytes>,
+    unreliable_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
     closed: Arc<RwLock<bool>>,
+    close_token: CancellationToken,
 }
 
 impl Session {
@@ -60,6 +118,7 @@ impl Session {
         capacity: usize,
     ) -> Self {
         let (packet_tx, packet_rx) = mpsc::channel(capacity);
+        let (unreliable_tx, unreliable_rx) = mpsc::channel(capacity);
 
         Self {
             ice,
@@ -70,9 +129,13 @@ impl Session {
             reliable_channel: Arc::new(Mutex::new(None)),
             unreliable_channel: Arc::new(Mutex::new(None)),
             message_buffer: Arc::new(Mutex::new(Message::new())),
+            unreliable_buffer: Arc::new(Mutex::new(Message::new())),
             packet_tx,
             packet_rx: Arc::new(Mutex::new(packet_rx)),
+            unreliable_tx,
+            unreliable_rx: Arc::new(Mutex::new(unreliable_rx)),
             closed: Arc::new(RwLock::new(false)),
+            close_token: CancellationToken::new(),
         }
     }
 
@@ -80,56 +143,27 @@ impl Session {
     ///
     /// The provided channel will receive an `on_message` handler that decodes incoming bytes as `MessageSegment`s, accumulates segments in the session's internal buffer, and forwards completed messages to the session's packet receiver. The channel is then stored as the session's reliable data channel.
     pub async fn set_reliable_channel(&self, channel: Arc<RTCDataChannel>) -> Result<()> {
-        let message_buffer = self.message_buffer.clone();
-        let packet_tx = self.packet_tx.clone();
-
-        channel.on_message(Box::new(move |msg| {
-            let data = msg.data.clone();
-            let buffer = message_buffer.clone();
-            let tx = packet_tx.clone();
-
-            Box::pin(async move {
-                let data_len = data.len();
-                match MessageSegment::decode(data.clone()) {
-                    Ok(segment) => {
-                        let result = {
-                            let mut buf = buffer.lock().await;
-                            buf.add_segment(segment)
-                        };
-                        match result {
-                            Ok(Some(complete_msg)) => {
-                                // Use async send to handle backpressure with bounded channel
-                                // If send fails, it means the receiver has been dropped
-                                let _ = tx.send(complete_msg).await;
-                            }
-                            Ok(None) => {
-                                tracing::debug!("incomplete segment added to buffer, waiting for more segments");
-                            }
-                            Err(e) => {
-                                tracing::warn!("failed to add segment to buffer: {:?}, data length: {}", e, data_len);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to decode message segment: {:?}, data length: {}, data preview: {:?}",
-                            e,
-                            data_len,
-                            &data.as_ref()[..data_len.min(64)]
-                        );
-                    }
-                }
-            })
-        }));
+        attach_message_handler(
+            &channel,
+            self.message_buffer.clone(),
+            self.packet_tx.clone(),
+        );
 
         *self.reliable_channel.lock().await = Some(channel);
         Ok(())
     }
 
-    /// Attaches an unreliable RTC data channel to the session.
+    /// Attaches an unreliable RTC data channel to the session and routes incoming
+    /// message segments into a separate reassembly pipeline.
     ///
     /// Replaces any previously set unreliable data channel with the provided one.
     pub async fn set_unreliable_channel(&self, channel: Arc<RTCDataChannel>) -> Result<()> {
+        attach_message_handler(
+            &channel,
+            self.unreliable_buffer.clone(),
+            self.unreliable_tx.clone(),
+        );
+
         *self.unreliable_channel.lock().await = Some(channel);
         Ok(())
     }
@@ -166,6 +200,51 @@ impl Session {
         Ok(())
     }
 
+    /// Sends data over the session using the unreliable data channel.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `NethernetError::ConnectionClosed` if the session has been closed.
+    /// - Returns `NethernetError::DataChannel(...)` if the unreliable channel is not set
+    ///   or if sending a segment fails.
+    ///
+    /// Data sent over a channel that was opened out of band is dropped by remote
+    /// connections that did not open the matching channel themselves.
+    pub async fn send_unreliable(&self, data: Bytes) -> Result<()> {
+        if *self.closed.read().await {
+            return Err(NethernetError::ConnectionClosed);
+        }
+
+        let channel = {
+            let guard = self.unreliable_channel.lock().await;
+            guard
+                .as_ref()
+                .ok_or_else(|| {
+                    NethernetError::DataChannel("Unreliable channel not set".to_string())
+                })?
+                .clone()
+        };
+        for segment in Message::split_into_segments(data)? {
+            channel
+                .send(&segment.encode())
+                .await
+                .map_err(|e| NethernetError::DataChannel(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
+    /// Receives the next complete packet from the unreliable data channel.
+    ///
+    /// Returns `Ok(None)` once the session has been closed.
+    pub async fn recv_unreliable(&self) -> Result<Option<Bytes>> {
+        if *self.closed.read().await {
+            return Ok(None);
+        }
+
+        Ok(self.unreliable_rx.lock().await.recv().await)
+    }
+
     /// Receives the next complete packet from the session.
     ///
     /// This returns the next reassembled message produced by the session's incoming
@@ -191,6 +270,8 @@ impl Session {
         }
         *closed = true;
         drop(closed);
+
+        self.close_token.cancel();
 
         // Acquire lock, clone the channel, drop the lock, then close
         let reliable = self.reliable_channel.lock().await.clone();
@@ -264,55 +345,13 @@ impl Session {
         self.ice.clone()
     }
 
+    /// Resolves once the session has been closed.
+    pub async fn closed(&self) {
+        self.close_token.cancelled().await
+    }
+
     /// Reports whether the session has been closed.
     pub async fn is_closed(&self) -> bool {
         *self.closed.read().await
-    }
-
-    /// Checks if both reliable and unreliable channels are set.
-    pub async fn is_fully_connected(&self) -> bool {
-        // Avoid holding both locks at once to prevent potential deadlocks
-        let reliable_connected = self.reliable_channel.lock().await.is_some();
-        if !reliable_connected {
-            return false;
-        }
-        self.unreliable_channel.lock().await.is_some()
-    }
-
-    /// Waits for the WebRTC connection to be fully established.
-    ///
-    /// This method polls the ICE connection state until it reaches Connected or Completed state,
-    /// or returns an error if the connection fails.
-    pub async fn wait_for_connection(&self, timeout_ms: Option<u64>) -> Result<()> {
-        let timeout = timeout_ms.unwrap_or(5000);
-        let max_attempts = (timeout / 100).max(1); // Check every 100ms
-
-        for attempt in 0..max_attempts {
-            let state = self.connection_state();
-
-            tracing::trace!(
-                "Waiting for WebRTC connection... (attempt {}/{}), state: {:?}",
-                attempt + 1,
-                max_attempts,
-                state
-            );
-
-            match state {
-                RTCIceTransportState::Connected | RTCIceTransportState::Completed => {
-                    tracing::info!("WebRTC connection established!");
-                    return Ok(());
-                }
-                RTCIceTransportState::Failed
-                | RTCIceTransportState::Disconnected
-                | RTCIceTransportState::Closed => {
-                    return Err(NethernetError::ConnectionClosed);
-                }
-                _ => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-
-        Err(NethernetError::Timeout)
     }
 }

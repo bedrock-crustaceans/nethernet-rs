@@ -68,6 +68,35 @@ impl ServerData {
     /// Returns a vector of bytes on success or a NethernetError if encoding fails (for example,
     /// if a field value would overflow its encoded form or an I/O write fails).
     ///
+    /// Parses a RakNet pong response as sent by Minecraft listeners.
+    ///
+    /// The pong is a `;` separated list, of which the server name, level name, player
+    /// counts and game mode are used. Transport layer and connection type are set to
+    /// the values vanilla clients expect for LAN discovery over NetherNet.
+    pub fn from_pong_data(data: &[u8]) -> Result<Self> {
+        let pong = std::str::from_utf8(data)
+            .map_err(|e| NethernetError::Other(format!("invalid pong data UTF-8: {}", e)))?;
+        let parts: Vec<&str> = pong.split(';').collect();
+        if parts.len() < 9 {
+            return Err(NethernetError::Other(format!(
+                "unexpected pong data format: {} fields, expected at least 9",
+                parts.len()
+            )));
+        }
+
+        Ok(Self {
+            server_name: parts[1].to_string(),
+            level_name: parts[7].to_string(),
+            game_type: game_type(parts[8]),
+            player_count: parts[4].parse().unwrap_or(0),
+            max_player_count: parts[5].parse().unwrap_or(0),
+            editor_world: false,
+            hardcore: false,
+            transport_layer: 2,
+            connection_type: 4,
+        })
+    }
+
     pub fn marshal(&self) -> Result<Vec<u8>> {
         // Validate fields that will be shifted to prevent overflow
         if self.game_type >= 128 {
@@ -182,6 +211,16 @@ impl ServerData {
     }
 }
 
+/// Returns the game type for the game mode name of a RakNet pong response.
+fn game_type(mode: &str) -> u8 {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "creative" => 1,
+        "adventure" => 2,
+        "spectator" => 6,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +251,25 @@ mod tests {
         assert_eq!(original.hardcore, decoded.hardcore);
         assert_eq!(original.transport_layer, decoded.transport_layer);
         assert_eq!(original.connection_type, decoded.connection_type);
+    }
+
+    #[test]
+    fn test_from_pong_data() {
+        let pong = b"MCPE;Dedicated Server;800;1.21.0;3;10;13253860892328930865;Bedrock level;Creative;1;19132;19133;";
+        let data = ServerData::from_pong_data(pong).unwrap();
+
+        assert_eq!(data.server_name, "Dedicated Server");
+        assert_eq!(data.level_name, "Bedrock level");
+        assert_eq!(data.game_type, 1);
+        assert_eq!(data.player_count, 3);
+        assert_eq!(data.max_player_count, 10);
+        assert_eq!(data.transport_layer, 2);
+        assert_eq!(data.connection_type, 4);
+    }
+
+    #[test]
+    fn test_from_pong_data_rejects_short_input() {
+        assert!(ServerData::from_pong_data(b"MCPE;Server").is_err());
     }
 
     #[test]

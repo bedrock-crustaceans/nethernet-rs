@@ -4,11 +4,14 @@ pub mod stream;
 pub use listener::NethernetListener;
 pub use stream::NethernetStream;
 
+use crate::credentials::{Credentials, gather_options};
 use crate::error::{NethernetError, Result};
 use crate::protocol::constants::SCTP_MAX_MESSAGE_SIZE;
 use crate::protocol::webrtc::Description;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::{API, APIBuilder};
@@ -16,10 +19,49 @@ use webrtc::dtls_transport::RTCDtlsTransport;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::ice_transport::RTCIceTransport;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-use webrtc::ice_transport::ice_gatherer::{RTCIceGatherOptions, RTCIceGatherer};
+use webrtc::ice_transport::ice_gatherer::RTCIceGatherer;
 use webrtc::ice_transport::ice_parameters::RTCIceParameters;
 use webrtc::sctp_transport::RTCSctpTransport;
 use webrtc::sctp_transport::sctp_transport_capabilities::SCTPTransportCapabilities;
+
+/// Options applied while negotiating and establishing a connection.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionConfig {
+    /// Timeouts of each negotiation step.
+    pub timeouts: Timeouts,
+
+    /// Cancels the negotiation when triggered. Connections that are already established
+    /// are unaffected, as they are closed through the session itself.
+    pub cancel_token: CancellationToken,
+}
+
+/// Timeouts applied while negotiating and establishing a connection.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// Time to wait for the answer of the remote connection. Only used while dialing.
+    pub negotiation: Duration,
+
+    /// Time to wait for the first candidate signaled by the remote connection.
+    pub candidate: Duration,
+
+    /// Time to wait for each transport to start.
+    pub start: Duration,
+
+    /// Time to wait for the data channels created by the remote connection. Only used
+    /// while listening, as the dialing side creates them itself.
+    pub channel: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            negotiation: Duration::from_secs(15),
+            candidate: Duration::from_secs(5),
+            start: Duration::from_secs(5),
+            channel: Duration::from_secs(5),
+        }
+    }
+}
 
 /// The transports backing a single connection.
 ///
@@ -35,13 +77,16 @@ pub(crate) struct Transports {
 }
 
 impl Transports {
-    pub(crate) fn new(setting_engine: SettingEngine) -> Result<Self> {
+    pub(crate) fn new(
+        setting_engine: SettingEngine,
+        credentials: Option<&Credentials>,
+    ) -> Result<Self> {
         let api = APIBuilder::new()
             .with_media_engine(MediaEngine::default())
             .with_setting_engine(setting_engine)
             .build();
 
-        let gatherer = Arc::new(api.new_ice_gatherer(RTCIceGatherOptions::default())?);
+        let gatherer = Arc::new(api.new_ice_gatherer(gather_options(credentials))?);
         let ice = Arc::new(api.new_ice_transport(gatherer.clone()));
         let dtls = Arc::new(api.new_dtls_transport(ice.clone(), vec![])?);
         let sctp = Arc::new(api.new_sctp_transport(dtls.clone())?);
@@ -87,6 +132,7 @@ impl Transports {
         &self,
         ice: RTCIceParameters,
         role: DTLSRole,
+        candidates: Vec<RTCIceCandidate>,
     ) -> Result<Description> {
         let mut dtls = self.dtls.get_local_parameters()?;
         if dtls.fingerprints.is_empty() {
@@ -102,6 +148,7 @@ impl Transports {
             sctp: SCTPTransportCapabilities {
                 max_message_size: SCTP_MAX_MESSAGE_SIZE,
             },
+            candidates,
         })
     }
 }

@@ -15,8 +15,35 @@ use tokio::sync::{RwLock as AsyncRwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-const BROADCAST_INTERVAL: Duration = Duration::from_secs(2);
-const ADDRESS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Options for LAN discovery.
+#[derive(Debug, Clone)]
+pub struct LanConfig {
+    /// Port servers listen on for discovery requests. Vanilla clients broadcast to
+    /// [`constants::LAN_DISCOVERY_PORT`], so it should only be changed for testing.
+    pub discovery_port: u16,
+
+    /// Address discovery requests are broadcast to. If [`None`], requests are broadcast
+    /// to the discovery port, unless the socket is bound to that port itself, in which
+    /// case no requests are broadcast at all.
+    pub broadcast_address: Option<SocketAddr>,
+
+    /// Interval between broadcasts of discovery requests.
+    pub broadcast_interval: Duration,
+
+    /// Time an address of a remote network is kept after its last packet.
+    pub address_timeout: Duration,
+}
+
+impl Default for LanConfig {
+    fn default() -> Self {
+        Self {
+            discovery_port: constants::LAN_DISCOVERY_PORT,
+            broadcast_address: None,
+            broadcast_interval: Duration::from_secs(2),
+            address_timeout: Duration::from_secs(15),
+        }
+    }
+}
 
 /// Protocol-defined ping token used for keepalive/discovery messages
 /// This is the exact wire format expected by the protocol
@@ -52,6 +79,15 @@ impl LanSignaling {
     /// receive LAN signaling messages; on failure returns the underlying I/O or
     /// setup error.
     pub async fn new(network_id: u64, bind_addr: SocketAddr) -> Result<Self> {
+        Self::with_config(network_id, bind_addr, LanConfig::default()).await
+    }
+
+    /// Creates and starts a new LanSignaling instance using the given options.
+    pub async fn with_config(
+        network_id: u64,
+        bind_addr: SocketAddr,
+        config: LanConfig,
+    ) -> Result<Self> {
         let socket = UdpSocket::bind(bind_addr).await?;
         socket.set_broadcast(true)?;
 
@@ -59,14 +95,14 @@ impl LanSignaling {
         // Capacity of 100 should be sufficient for signal buffering
         let (signal_tx, _signal_rx) = broadcast::channel(100);
 
-        // If not binding to DEFAULT_PORT, enable broadcast to DEFAULT_PORT
-        let broadcast_addr = if bind_addr.port() != constants::LAN_DISCOVERY_PORT {
-            Some(SocketAddr::new(
+        // Servers bound to the discovery port answer requests instead of broadcasting them
+        let broadcast_addr = match config.broadcast_address {
+            Some(addr) => Some(addr),
+            None if bind_addr.port() != config.discovery_port => Some(SocketAddr::new(
                 Ipv4Addr::BROADCAST.into(),
-                constants::LAN_DISCOVERY_PORT,
-            ))
-        } else {
-            None
+                config.discovery_port,
+            )),
+            None => None,
         };
 
         let cancel_token = CancellationToken::new();
@@ -85,6 +121,7 @@ impl LanSignaling {
             discovered_servers.clone(),
             broadcast_addr,
             cancel_token.clone(),
+            config,
         );
 
         let signaling = Self {
@@ -117,6 +154,11 @@ impl LanSignaling {
         }
     }
 
+    /// Sets the server data advertised in response to discovery requests.
+    pub fn set_server_data(&self, server_data: ServerData) {
+        *self.server_data.write().unwrap_or_else(|e| e.into_inner()) = Some(server_data);
+    }
+
     /// Returns a snapshot of discovered servers keyed by their network ID.
     ///
     /// Clones and returns the current internal map of discovered `ServerData` entries.
@@ -146,10 +188,11 @@ impl LanSignaling {
         discovered_servers: Arc<AsyncRwLock<HashMap<u64, ServerData>>>,
         broadcast_addr: Option<SocketAddr>,
         cancel_token: CancellationToken,
+        config: LanConfig,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
-            let mut interval = tokio::time::interval(BROADCAST_INTERVAL);
+            let mut interval = tokio::time::interval(config.broadcast_interval);
 
             loop {
                 tokio::select! {
@@ -177,7 +220,7 @@ impl LanSignaling {
                         }
                     }
                     _ = interval.tick() => {
-                        Self::cleanup_addresses(&addresses).await;
+                        Self::cleanup_addresses(&addresses, config.address_timeout).await;
 
                         // Send broadcast request if client
                         if let Some(addr) = broadcast_addr {
@@ -345,13 +388,16 @@ impl LanSignaling {
         Ok(())
     }
 
-    /// Removes peer address entries whose `last_seen` timestamp is older than `ADDRESS_TIMEOUT`.
+    /// Removes peer address entries whose `last_seen` timestamp is older than the timeout.
     ///
     /// This function acquires a write lock on the provided address map and retains only entries
     /// observed within the configured timeout window, mutating the map in place.
-    async fn cleanup_addresses(addresses: &Arc<AsyncRwLock<HashMap<u64, AddressEntry>>>) {
+    async fn cleanup_addresses(
+        addresses: &Arc<AsyncRwLock<HashMap<u64, AddressEntry>>>,
+        timeout: Duration,
+    ) {
         let mut addrs = addresses.write().await;
-        addrs.retain(|_, entry| entry.last_seen.elapsed() < ADDRESS_TIMEOUT);
+        addrs.retain(|_, entry| entry.last_seen.elapsed() < timeout);
     }
 }
 
@@ -424,9 +470,11 @@ impl Signaling for LanSignaling {
         self.network_id.to_string()
     }
 
-    /// Update the stored server "pong" data from marshalled bytes.
-    fn set_pong_data(&self, data: Vec<u8>) {
-        *self.server_data.write().unwrap_or_else(|e| e.into_inner()) =
-            ServerData::unmarshal(&data).ok();
+    /// Update the stored server data from a RakNet pong response.
+    fn set_pong_data(&self, data: &[u8]) {
+        match ServerData::from_pong_data(data) {
+            Ok(server_data) => self.set_server_data(server_data),
+            Err(e) => tracing::error!("Failed to parse pong data: {}", e),
+        }
     }
 }
