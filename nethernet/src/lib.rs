@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod protocol;
 pub mod sans;
 pub mod session;
