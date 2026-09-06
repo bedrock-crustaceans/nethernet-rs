@@ -108,10 +108,14 @@ impl DtlsLayer {
             .map(|msg| (msg.message.to_vec(), msg.transport.peer_addr))
     }
 
+    /// Advances the handshake/retransmission timers. A no-op until a connection with
+    /// the remote peer exists (nothing to time out yet): for the server role, that's
+    /// only once the first inbound packet has created one.
     pub fn handle_timeout(&mut self, now: Instant) -> Result<()> {
-        self.endpoint
-            .handle_timeout(self.remote_addr, now)
-            .map_err(|e| ProtocolError::Other(format!("{e}")))
+        // The only failure mode here is "no connection yet for this remote", which
+        // just means there is nothing to time out yet.
+        let _ = self.endpoint.handle_timeout(self.remote_addr, now);
+        Ok(())
     }
 
     /// The next time `handle_timeout` should be called, if a handshake retransmission
