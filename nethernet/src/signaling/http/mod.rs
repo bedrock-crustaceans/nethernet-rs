@@ -248,9 +248,12 @@ impl HttpSignaler {
             },
         );
 
-        self.output.push_back(HttpSignalerOutput::Signal(
-            Signal::offer(connection_id, offer.into(), network_id),
-        ));
+        self.output
+            .push_back(HttpSignalerOutput::Signal(Signal::offer(
+                connection_id,
+                offer.into(),
+                network_id,
+            )));
         self.output
             .push_back(HttpSignalerOutput::Timeout(JOIN_TIMEOUT));
 
@@ -281,9 +284,12 @@ impl HttpSignaler {
         match *request.request.method() {
             Method::POST => {
                 let candidate = request.request.body().clone();
-                self.output.push_back(HttpSignalerOutput::Signal(
-                    Signal::candidate(connection_id, candidate.into(), network_id),
-                ));
+                self.output
+                    .push_back(HttpSignalerOutput::Signal(Signal::candidate(
+                        connection_id,
+                        candidate.into(),
+                        network_id,
+                    )));
                 self.respond(request.addr, StatusCode::ACCEPTED)
             }
             Method::GET => {
@@ -536,10 +542,8 @@ mod tests {
         assert!(matches!(s.poll(), Some(HttpSignalerOutput::Timeout(_))));
         assert!(s.poll().is_none());
 
-        s.handle(HttpSignalerInput::Timeout(
-            now + CANDIDATES_POLL_TIMEOUT,
-        ))
-        .unwrap();
+        s.handle(HttpSignalerInput::Timeout(now + CANDIDATES_POLL_TIMEOUT))
+            .unwrap();
         let HttpSignalerOutput::Response(resp) = s.poll().unwrap() else {
             panic!("expected response");
         };

@@ -6,7 +6,9 @@ use crate::protocol::constants::{
     ADDRESS_TIMEOUT, BROADCAST_INTERVAL, ID_MESSAGE_PACKET, ID_REQUEST_PACKET, ID_RESPONSE_PACKET,
     LAN_DISCOVERY_PORT,
 };
-use crate::protocol::packet::discovery::{self, MessagePacket, RequestPacket, ResponsePacket, ServerData};
+use crate::protocol::packet::discovery::{
+    self, MessagePacket, RequestPacket, ResponsePacket, ServerData,
+};
 use crate::sans::Sans;
 use crate::signaling::lan::error::LanSignalerError;
 use crate::signaling::lan::input::LanSignalerInput;
@@ -291,7 +293,10 @@ mod tests {
         let LanSignalerOutput::Signal(signal) = b.poll().expect("signal decoded") else {
             panic!("expected Signal output");
         };
-        assert_eq!(signal.signal_type, crate::signaling::signal::SignalType::Offer);
+        assert_eq!(
+            signal.signal_type,
+            crate::signaling::signal::SignalType::Offer
+        );
         assert_eq!(signal.connection_id, 42);
         assert_eq!(signal.data, "v=0...");
         assert_eq!(signal.network_id, 1);
