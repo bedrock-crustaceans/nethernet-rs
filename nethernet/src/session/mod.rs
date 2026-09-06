@@ -3,6 +3,8 @@
 
 mod dtls;
 mod ice;
+mod sctp;
 
 pub use dtls::{DtlsLayer, ResolvedRole as DtlsResolvedRole};
 pub use ice::IceLayer;
+pub use sctp::SctpLayer;
