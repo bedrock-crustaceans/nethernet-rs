@@ -19,8 +19,8 @@ use rtc::sdp::description::common::{Address, Attribute, ConnectionInformation};
 use rtc::sdp::description::media::{MediaDescription, MediaName, RangedPort};
 use rtc::sdp::description::session::{
     ATTR_KEY_CONNECTION_SETUP, ATTR_KEY_END_OF_CANDIDATES, ATTR_KEY_EXTMAP_ALLOW_MIXED,
-    ATTR_KEY_GROUP, ATTR_KEY_MAX_MESSAGE_SIZE, ATTR_KEY_MID, ATTR_KEY_MSID_SEMANTIC, Origin,
-    SessionDescription, TimeDescription,
+    ATTR_KEY_GROUP, ATTR_KEY_IDENTITY, ATTR_KEY_MAX_MESSAGE_SIZE, ATTR_KEY_MID,
+    ATTR_KEY_MSID_SEMANTIC, Origin, SessionDescription, TimeDescription,
 };
 use rtc::sdp::util::ConnectionRole;
 use std::io::Cursor;
@@ -47,6 +47,11 @@ pub struct Description {
     /// `(algorithm, value)`, e.g. `("sha-256", "AA:BB:...")`.
     pub fingerprint: (String, String),
     pub sctp_max_message_size: u32,
+    /// The raw `a=identity` attribute value, if present (see
+    /// [`crate::protocol::webrtc::identity`], and the NetherNet HTTP signaling guide,
+    /// section 5). `Description` treats this as an opaque string - building and
+    /// verifying its contents is the `identity` module's job.
+    pub identity: Option<String>,
 }
 
 impl Description {
@@ -57,7 +62,7 @@ impl Description {
         let media = self
             .base_media()
             .with_value_attribute("ice-options".to_string(), "trickle".to_string());
-        Self::session(media).marshal()
+        Self::session(media, self.identity.as_deref()).marshal()
     }
 
     /// Encodes the description for full ICE (NetherNet's HTTP signaling): every
@@ -69,7 +74,7 @@ impl Description {
             media = media.with_candidate(candidate::attribute_value(index, c, &self.ice.ufrag));
         }
         media = media.with_value_attribute(ATTR_KEY_END_OF_CANDIDATES.to_string(), "".to_string());
-        Self::session(media).marshal()
+        Self::session(media, self.identity.as_deref()).marshal()
     }
 
     /// Parses the SDP signaled by a remote connection, returning the description and
@@ -119,18 +124,47 @@ impl Description {
             }
         }
 
+        let identity = session.attribute(ATTR_KEY_IDENTITY).cloned();
+
         Ok((
             Self {
                 ice: Credentials { ufrag, pwd },
                 dtls_role,
                 fingerprint: (algorithm.to_string(), value.to_string()),
                 sctp_max_message_size,
+                identity,
             },
             candidates,
         ))
     }
 
-    fn session(media: MediaDescription) -> SessionDescription {
+    /// Builds the session-level SDP wrapper around `media`. `identity`, if given, is
+    /// the `a=identity` attribute value (see [`crate::protocol::webrtc::identity`]);
+    /// per the guide's section 5, it is a session-level attribute that must come before
+    /// the first `m=` line, which placing it among the other session attributes here
+    /// satisfies regardless of the marshaled attribute order.
+    fn session(media: MediaDescription, identity: Option<&str>) -> SessionDescription {
+        let mut attributes = vec![
+            Attribute {
+                key: ATTR_KEY_GROUP.to_string(),
+                value: Some("BUNDLE 0".to_string()),
+            },
+            Attribute {
+                key: ATTR_KEY_EXTMAP_ALLOW_MIXED.to_string(),
+                value: None,
+            },
+            Attribute {
+                key: ATTR_KEY_MSID_SEMANTIC.to_string(),
+                value: Some(" WMS".to_string()),
+            },
+        ];
+        if let Some(identity) = identity {
+            attributes.push(Attribute {
+                key: ATTR_KEY_IDENTITY.to_string(),
+                value: Some(identity.to_string()),
+            });
+        }
+
         SessionDescription {
             version: 0,
             origin: Origin {
@@ -143,20 +177,7 @@ impl Description {
             },
             session_name: "-".to_string(),
             time_descriptions: vec![TimeDescription::default()],
-            attributes: vec![
-                Attribute {
-                    key: ATTR_KEY_GROUP.to_string(),
-                    value: Some("BUNDLE 0".to_string()),
-                },
-                Attribute {
-                    key: ATTR_KEY_EXTMAP_ALLOW_MIXED.to_string(),
-                    value: None,
-                },
-                Attribute {
-                    key: ATTR_KEY_MSID_SEMANTIC.to_string(),
-                    value: Some(" WMS".to_string()),
-                },
-            ],
+            attributes,
             ..Default::default()
         }
         .with_media(media)
@@ -244,6 +265,7 @@ mod tests {
             dtls_role: role,
             fingerprint: ("sha-256".to_string(), "AB:CD:EF".to_string()),
             sctp_max_message_size: 65536,
+            identity: None,
         }
     }
 
@@ -320,5 +342,27 @@ mod tests {
             .collect();
 
         assert!(Description::parse(&without_fingerprint).is_err());
+    }
+
+    #[test]
+    fn identity_attribute_is_session_level_and_roundtrips() {
+        let mut with_identity = description(DtlsRole::Server);
+        with_identity.identity = Some("opaque-identity-blob".to_string());
+
+        let encoded = with_identity.encode_trickle();
+        // Session-level: appears before the first `m=` line.
+        let identity_pos = encoded.find("a=identity:opaque-identity-blob").unwrap();
+        let media_pos = encoded.find("m=application").unwrap();
+        assert!(identity_pos < media_pos);
+
+        let (parsed, _) = Description::parse(&encoded).unwrap();
+        assert_eq!(parsed.identity.as_deref(), Some("opaque-identity-blob"));
+    }
+
+    #[test]
+    fn missing_identity_parses_as_none() {
+        let encoded = description(DtlsRole::Server).encode_trickle();
+        let (parsed, _) = Description::parse(&encoded).unwrap();
+        assert_eq!(parsed.identity, None);
     }
 }

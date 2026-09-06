@@ -119,6 +119,9 @@ impl Session {
             },
             fingerprint,
             sctp_max_message_size: SCTP_MAX_MESSAGE_SIZE,
+            // Set by the caller (see `crate::connection::Connection`) if this
+            // connection needs an `a=identity` assertion attached before encoding.
+            identity: None,
         };
 
         let session = Self {
