@@ -19,6 +19,10 @@ pub(crate) trait UdpDriven {
     /// [`nethernet::signaling::signal::Signal`] for LAN signaling, or a
     /// [`nethernet::session::SessionOutput`] for an established connection.
     type Output: Send + 'static;
+    /// Something the owning handle can inject from outside the driving loop - e.g.
+    /// "send this `Signal`" for LAN signaling, or "send this application message" for
+    /// a connection. `()` if this driver never needs external input beyond datagrams.
+    type Command: Send + 'static;
     type Error: std::fmt::Display;
 
     fn handle_packet(
@@ -27,6 +31,7 @@ pub(crate) trait UdpDriven {
         from: SocketAddr,
         now: Instant,
     ) -> Result<(), Self::Error>;
+    fn handle_command(&mut self, command: Self::Command, now: Instant) -> Result<(), Self::Error>;
     fn handle_timeout(&mut self, now: Instant) -> Result<(), Self::Error>;
     /// The next time [`Self::handle_timeout`] should be called, if anything is
     /// pending.
@@ -47,17 +52,19 @@ pub(crate) enum UdpDrivenOutput<O> {
 /// always `select!` on a single sleep future rather than an optional one.
 const NO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// Runs `driven` to completion (i.e. forever, until the task is aborted or the socket
-/// errors out): feeds it inbound datagrams from `socket`, drives its timers, sends its
-/// outbound datagrams back out over `socket`, and forwards every other output to
-/// `output_tx`.
+/// Runs `driven` to completion: feeds it inbound datagrams from `socket` and commands
+/// from `command_rx`, drives its timers, sends its outbound datagrams back out over
+/// `socket`, and forwards every other output to `output_tx`. Returns once either
+/// channel's counterpart is dropped (the owning handle went away) - whichever comes
+/// first.
 ///
 /// Logs (via `tracing`) and otherwise ignores errors from `handle_packet`/
-/// `handle_timeout` - a single malformed or spurious datagram, or a benign protocol
-/// hiccup, should not tear down the whole driver.
+/// `handle_command`/`handle_timeout` - a single malformed or spurious datagram, or a
+/// benign protocol hiccup, should not tear down the whole driver.
 pub(crate) async fn run<T>(
     socket: Arc<UdpSocket>,
     mut driven: T,
+    mut command_rx: mpsc::UnboundedReceiver<T::Command>,
     output_tx: mpsc::UnboundedSender<T::Output>,
 ) where
     T: UdpDriven,
@@ -101,6 +108,18 @@ pub(crate) async fn run<T>(
                     Err(e) => tracing::debug!("recv error: {e}"),
                 }
             }
+            command = command_rx.recv() => {
+                match command {
+                    Some(command) => {
+                        let now = Instant::now();
+                        if let Err(e) = driven.handle_command(command, now) {
+                            tracing::debug!("command handling error: {e}");
+                        }
+                    }
+                    // The owning handle was dropped; nothing left to drive for.
+                    None => return,
+                }
+            }
             _ = tokio::time::sleep(delay) => {
                 let now = Instant::now();
                 if let Err(e) = driven.handle_timeout(now) {
@@ -127,6 +146,7 @@ mod tests {
 
     impl UdpDriven for Echo {
         type Output = Vec<u8>;
+        type Command = ();
         type Error = Infallible;
 
         fn handle_packet(
@@ -136,6 +156,10 @@ mod tests {
             _now: Instant,
         ) -> Result<(), Infallible> {
             self.received.push_back(data.to_vec());
+            Ok(())
+        }
+
+        fn handle_command(&mut self, _command: (), _now: Instant) -> Result<(), Infallible> {
             Ok(())
         }
 
@@ -163,6 +187,8 @@ mod tests {
 
         let (a_tx, mut a_rx) = mpsc::unbounded_channel();
         let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+        let (_a_cmd_tx, a_cmd_rx) = mpsc::unbounded_channel();
+        let (_b_cmd_tx, b_cmd_rx) = mpsc::unbounded_channel();
 
         let a_driven = Echo {
             greeting: Some((b"hello from a".to_vec(), b_addr)),
@@ -173,8 +199,8 @@ mod tests {
             received: VecDeque::new(),
         };
 
-        tokio::spawn(run(a.clone(), a_driven, a_tx));
-        tokio::spawn(run(b.clone(), b_driven, b_tx));
+        tokio::spawn(run(a.clone(), a_driven, a_cmd_rx, a_tx));
+        tokio::spawn(run(b.clone(), b_driven, b_cmd_rx, b_tx));
 
         // b receives a's greeting and forwards it as an Output.
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), b_rx.recv())
