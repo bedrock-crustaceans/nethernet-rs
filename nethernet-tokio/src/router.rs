@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+/// A `tokio::sync::Mutex` (not `std::sync::Mutex`) - held across `.recv().await` in
+/// [`SignalRouter::recv_unrouted`], so it must not block the executor thread.
+type UnroutedRx = tokio::sync::Mutex<mpsc::UnboundedReceiver<UnroutedSignal>>;
+
 /// Anything that can send a [`Signal`] and, exclusively, receive the next one - the
 /// shape both [`crate::lan::LanSignaler`] and
 /// [`crate::http::server::HttpSignalingServer`] share.
@@ -61,10 +65,15 @@ pub struct UnroutedSignal {
 /// Owns a signaler's one `recv()`/`send()` pair in a background task and fans its
 /// incoming signals out: registered `(network_id, connection_id)` pairs get their own
 /// signals; everything else goes to the catch-all receiver.
+///
+/// Every method takes `&self` (the catch-all receiver is behind an async `Mutex`), so a
+/// `SignalRouter` can be shared - typically via `Arc` - across as many concurrently
+/// negotiating connection attempts as are in flight, plus (see [`crate::listener`]) a
+/// single task looping on [`Self::recv_unrouted`] to pick up new ones.
 pub struct SignalRouter {
     send_tx: mpsc::UnboundedSender<Signal>,
     routes: Routes,
-    unrouted_rx: mpsc::UnboundedReceiver<UnroutedSignal>,
+    unrouted_rx: UnroutedRx,
     task: JoinHandle<()>,
 }
 
@@ -84,7 +93,7 @@ impl SignalRouter {
         Self {
             send_tx,
             routes,
-            unrouted_rx,
+            unrouted_rx: tokio::sync::Mutex::new(unrouted_rx),
             task,
         }
     }
@@ -122,8 +131,8 @@ impl SignalRouter {
     /// back (see [`UnroutedSignal`]), so the caller can immediately start receiving any
     /// follow-up signals for the same connection (e.g. trickled candidates) without a
     /// gap in which they'd be misclassified as unrouted themselves.
-    pub async fn recv_unrouted(&mut self) -> Option<UnroutedSignal> {
-        self.unrouted_rx.recv().await
+    pub async fn recv_unrouted(&self) -> Option<UnroutedSignal> {
+        self.unrouted_rx.lock().await.recv().await
     }
 }
 

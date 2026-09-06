@@ -368,7 +368,7 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(100)).await;
 
         let offerer_router = SignalRouter::new(offerer_signaling);
-        let mut answerer_router = SignalRouter::new(answerer_signaling);
+        let answerer_router = SignalRouter::new(answerer_signaling);
 
         // The offerer's connect (which blocks awaiting an answer) and the answerer's
         // half of the exchange (receive the offer, build and send an answer) must run
