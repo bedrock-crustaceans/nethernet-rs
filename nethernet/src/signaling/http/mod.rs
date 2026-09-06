@@ -7,53 +7,48 @@ use crate::signaling::http::error::HttpSignalerError;
 use crate::signaling::http::input::{HttpSignalerInput, HttpSignalerRequest};
 use crate::signaling::http::output::{HttpSignalerOutput, HttpSignalerResponse};
 use crate::signaling::signal::{Signal, SignalType};
-use http::header::CONTENT_LENGTH;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{Method, Response, StatusCode};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Content type used for SDP offer/answer bodies, per the NetherNet HTTP signaling spec.
+const SDP_CONTENT_TYPE: &str = "application/sdp";
+
 /// How long a join POST is held open awaiting an answer before it is failed with a timeout.
+/// The spec does not mandate a value; the client sends exactly one request and does not
+/// retry, so this only bounds how long a stalled host can keep the connection hanging.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a candidates long-poll GET is held open awaiting a new candidate before it
-/// is completed with an empty (no new candidates) response.
-const CANDIDATES_POLL_TIMEOUT: Duration = Duration::from_secs(25);
 
 struct PendingJoin {
     addr: u64,
-    network_id: u64,
+    connection_id: u64,
     timeout: Instant,
 }
 
-struct PendingCandidatesGet {
-    addr: u64,
-    since: usize,
-    timeout: Instant,
-}
-
-struct ConnectionState {
-    network_id: u64,
-    /// Candidates trickled by the host, in the order they were produced.
-    host_candidates: Vec<Box<str>>,
-    /// An outstanding long-poll GET awaiting candidates past `since`.
-    pending_get: Option<PendingCandidatesGet>,
-}
-
-/// Sans-IO HTTP signaler.
+/// Sans-IO implementation of the NetherNet HTTP signaling protocol, per the
+/// [partner onboarding guide](https://github.com/Mojang/bedrock-protocol-docs/blob/main/additional_docs/NetherNetOnboardingGuide.md).
 ///
-/// Models a rendezvous service: a client `POST`s an SDP offer to `/v1/join/{network_id}`
-/// naming the host it wants to connect to; the request is held open until the host
-/// (driving this same signaler) answers via [`HttpSignalerInput::Signal`], at which point
-/// the response completes with the answer SDP. Trickled ICE candidates flow through
-/// `/v1/candidates/{network_id}/{connection_id}` in both directions: the client `POST`s
-/// its own candidates, and long-polls with `GET ...?since=N` for candidates trickled by
-/// the host.
+/// A client `GET`s `/v1/join` as a capability check, then `POST`s a *complete* SDP
+/// offer (NetherNet's HTTP signaling always uses full ICE — every candidate is already
+/// gathered and embedded in the SDP, never trickled) to `/v1/join/{networkId}`, where
+/// `networkId` is the *client's own* `NetworkID`. The request is held open until the
+/// driving application answers via [`HttpSignalerInput::Signal`] — [`SignalType::Answer`]
+/// completes it with `200 OK` and the answer SDP, [`SignalType::Error`] rejects it with
+/// `403 Forbidden` (e.g. after rejecting the offer's identity assertion) — or until
+/// [`JOIN_TIMEOUT`] elapses, whichever comes first.
+///
+/// Because full ICE means every candidate is already in the offer/answer, there is no
+/// separate candidate-trickling exchange over this transport: [`SignalType::Candidate`]
+/// signals are not meaningful here and are ignored.
 ///
 /// This type performs no I/O itself: feed it requests and timeouts via [`Sans::handle`]
 /// and drain responses/signals via [`Sans::poll`].
 pub struct HttpSignaler {
     next_connection_id: u64,
-    pending_joins: HashMap<u64, PendingJoin>,
-    connections: HashMap<u64, ConnectionState>,
+    /// Pending joins, keyed by the client's NetworkID. A legitimate client has at most
+    /// one connection attempt in flight at a time.
+    pending: HashMap<u64, PendingJoin>,
     output: VecDeque<HttpSignalerOutput>,
 }
 
@@ -85,8 +80,7 @@ impl HttpSignaler {
     pub fn new() -> Self {
         Self {
             next_connection_id: 1,
-            pending_joins: HashMap::new(),
-            connections: HashMap::new(),
+            pending: HashMap::new(),
             output: VecDeque::new(),
         }
     }
@@ -105,95 +99,65 @@ impl HttpSignaler {
         match segments.as_slice() {
             ["v1", "join"] => self.handle_join(&request)?,
             ["v1", "join", network_id] => self.handle_join_network(&request, network_id, now)?,
-            ["v1", "candidates", network_id, connection_id] => {
-                self.handle_candidates(&request, network_id, connection_id, now)?
-            }
             _ => self.respond(request.addr, StatusCode::NOT_FOUND)?,
         };
         Ok(())
     }
 
-    /// Handles answers and trickled candidates produced locally (by whichever host is
-    /// driving this signaler) that need to be relayed back to the waiting client.
+    /// Handles an answer or rejection produced locally (by whichever host is driving
+    /// this signaler) that needs to complete a pending join.
     fn handle_signal(&mut self, signal: Signal, _now: Instant) -> Result<(), HttpSignalerError> {
         match signal.signal_type {
             SignalType::Answer => self.handle_answer(signal),
-            SignalType::Candidate => self.handle_outbound_candidate(signal),
-            // Offers and errors are not meaningful for the host to originate over this
-            // transport; nothing to relay.
-            SignalType::Offer | SignalType::Error => Ok(()),
+            SignalType::Error => self.handle_error(signal),
+            // Full ICE means candidates never trickle over this transport, and the
+            // host never originates an offer here; nothing to relay.
+            SignalType::Offer | SignalType::Candidate => Ok(()),
         }
     }
 
     /// Completes a pending join with the host's answer SDP, if that join is still waiting.
     fn handle_answer(&mut self, signal: Signal) -> Result<(), HttpSignalerError> {
-        let Some(pending) = self.pending_joins.get(&signal.connection_id) else {
-            // No longer pending (already timed out, or an unknown connection ID).
+        let Some(pending) = self.take_pending(&signal) else {
             return Ok(());
         };
-        if pending.network_id != signal.network_id {
-            // Answer names a different host than the one this connection joined; ignore.
-            return Ok(());
-        }
-        let pending = self
-            .pending_joins
-            .remove(&signal.connection_id)
-            .expect("presence checked above");
-
-        self.respond_with_body(pending.addr, StatusCode::OK, signal.data.into())
+        self.respond_with_sdp(pending.addr, StatusCode::OK, signal.data.into())
     }
 
-    /// Records a candidate trickled by the host, completing an outstanding long-poll
-    /// GET for it if one is waiting.
-    fn handle_outbound_candidate(&mut self, signal: Signal) -> Result<(), HttpSignalerError> {
-        let Some(state) = self.connections.get_mut(&signal.connection_id) else {
+    /// Rejects a pending join (e.g. the host refused the offer's identity assertion).
+    fn handle_error(&mut self, signal: Signal) -> Result<(), HttpSignalerError> {
+        let Some(pending) = self.take_pending(&signal) else {
             return Ok(());
         };
-        if state.network_id != signal.network_id {
-            // Candidate names a different host than the one this connection joined; ignore.
-            return Ok(());
+        self.respond(pending.addr, StatusCode::FORBIDDEN)
+    }
+
+    /// Removes and returns the pending join for `signal`'s network ID, but only if it
+    /// is still waiting on exactly the connection this signal answers.
+    fn take_pending(&mut self, signal: &Signal) -> Option<PendingJoin> {
+        let matches = self
+            .pending
+            .get(&signal.network_id)
+            .is_some_and(|pending| pending.connection_id == signal.connection_id);
+        if matches {
+            self.pending.remove(&signal.network_id)
+        } else {
+            None
         }
-
-        state.host_candidates.push(signal.data.into());
-
-        if let Some(pending) = state.pending_get.take() {
-            let body = state.host_candidates[pending.since..].join("\n");
-            self.output
-                .push_back(HttpSignalerOutput::Response(HttpSignalerResponse {
-                    addr: pending.addr,
-                    response: Self::body(StatusCode::OK, body.into())?,
-                }));
-        }
-
-        Ok(())
     }
 
     fn handle_timeout(&mut self, now: Instant) -> Result<(), HttpSignalerError> {
-        let expired_joins: Vec<u64> = self
-            .pending_joins
+        let expired: Vec<u64> = self
+            .pending
             .iter()
             .filter(|(_, pending)| pending.timeout <= now)
-            .map(|(id, _)| *id)
+            .map(|(network_id, _)| *network_id)
             .collect();
 
-        for connection_id in expired_joins {
-            if let Some(pending) = self.pending_joins.remove(&connection_id) {
+        for network_id in expired {
+            if let Some(pending) = self.pending.remove(&network_id) {
                 self.respond(pending.addr, StatusCode::REQUEST_TIMEOUT)?;
             }
-            // No answer arrived in time; the connection never got established.
-            self.connections.remove(&connection_id);
-        }
-
-        let mut expired_responses = Vec::new();
-        for state in self.connections.values_mut() {
-            if state.pending_get.as_ref().is_some_and(|p| p.timeout <= now)
-                && let Some(pending) = state.pending_get.take()
-            {
-                expired_responses.push(pending.addr);
-            }
-        }
-        for addr in expired_responses {
-            self.respond(addr, StatusCode::NO_CONTENT)?;
         }
 
         Ok(())
@@ -226,25 +190,23 @@ impl HttpSignaler {
             return self.respond(request.addr, StatusCode::BAD_REQUEST);
         };
 
+        // A legitimate client sends exactly one signaling request per connection
+        // attempt and never retries; a second one while the first is still pending
+        // means the first has been superseded, so fail it outright.
+        if let Some(superseded) = self.pending.remove(&network_id) {
+            self.respond(superseded.addr, StatusCode::CONFLICT)?;
+        }
+
         let connection_id = self.next_connection_id;
         self.next_connection_id += 1;
 
         let offer = request.request.body().clone();
-
-        self.pending_joins.insert(
-            connection_id,
+        self.pending.insert(
+            network_id,
             PendingJoin {
                 addr: request.addr,
-                network_id,
+                connection_id,
                 timeout: now + JOIN_TIMEOUT,
-            },
-        );
-        self.connections.insert(
-            connection_id,
-            ConnectionState {
-                network_id,
-                host_candidates: Vec::new(),
-                pending_get: None,
             },
         );
 
@@ -260,70 +222,6 @@ impl HttpSignaler {
         Ok(())
     }
 
-    fn handle_candidates(
-        &mut self,
-        request: &HttpSignalerRequest,
-        network_id: &str,
-        connection_id: &str,
-        now: Instant,
-    ) -> Result<(), HttpSignalerError> {
-        let (Ok(network_id), Ok(connection_id)) =
-            (network_id.parse::<u64>(), connection_id.parse::<u64>())
-        else {
-            return self.respond(request.addr, StatusCode::BAD_REQUEST);
-        };
-
-        let matches_connection = self
-            .connections
-            .get(&connection_id)
-            .is_some_and(|state| state.network_id == network_id);
-        if !matches_connection {
-            return self.respond(request.addr, StatusCode::NOT_FOUND);
-        }
-
-        match *request.request.method() {
-            Method::POST => {
-                let candidate = request.request.body().clone();
-                self.output
-                    .push_back(HttpSignalerOutput::Signal(Signal::candidate(
-                        connection_id,
-                        candidate.into(),
-                        network_id,
-                    )));
-                self.respond(request.addr, StatusCode::ACCEPTED)
-            }
-            Method::GET => {
-                let since = Self::parse_since(request.request.uri().query());
-                let state = self
-                    .connections
-                    .get_mut(&connection_id)
-                    .expect("presence checked above");
-
-                if since < state.host_candidates.len() {
-                    let body = state.host_candidates[since..].join("\n");
-                    self.respond_with_body(request.addr, StatusCode::OK, body.into())
-                } else {
-                    state.pending_get = Some(PendingCandidatesGet {
-                        addr: request.addr,
-                        since,
-                        timeout: now + CANDIDATES_POLL_TIMEOUT,
-                    });
-                    self.output
-                        .push_back(HttpSignalerOutput::Timeout(CANDIDATES_POLL_TIMEOUT));
-                    Ok(())
-                }
-            }
-            _ => self.respond(request.addr, StatusCode::METHOD_NOT_ALLOWED),
-        }
-    }
-
-    fn parse_since(query: Option<&str>) -> usize {
-        query
-            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("since=")))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    }
-
     fn respond(&mut self, addr: u64, status: StatusCode) -> Result<(), HttpSignalerError> {
         self.output
             .push_back(HttpSignalerOutput::Response(HttpSignalerResponse {
@@ -333,7 +231,7 @@ impl HttpSignaler {
         Ok(())
     }
 
-    fn respond_with_body(
+    fn respond_with_sdp(
         &mut self,
         addr: u64,
         status: StatusCode,
@@ -342,7 +240,7 @@ impl HttpSignaler {
         self.output
             .push_back(HttpSignalerOutput::Response(HttpSignalerResponse {
                 addr,
-                response: Self::body(status, body)?,
+                response: Self::sdp_body(status, body)?,
             }));
         Ok(())
     }
@@ -354,9 +252,10 @@ impl HttpSignaler {
             .body("".into())
     }
 
-    fn body(status: StatusCode, body: Box<str>) -> http::Result<Response<Box<str>>> {
+    fn sdp_body(status: StatusCode, body: Box<str>) -> http::Result<Response<Box<str>>> {
         Response::builder()
             .status(status)
+            .header(CONTENT_TYPE, SDP_CONTENT_TYPE)
             .header(CONTENT_LENGTH, body.len())
             .body(body)
     }
@@ -432,7 +331,45 @@ mod tests {
         };
         assert_eq!(resp.addr, 1);
         assert_eq!(resp.response.status(), StatusCode::OK);
+        assert_eq!(
+            resp.response.headers().get(CONTENT_TYPE).unwrap(),
+            SDP_CONTENT_TYPE
+        );
         assert_eq!(resp.response.body().as_ref(), "answer-sdp");
+        assert!(s.poll().is_none());
+    }
+
+    #[test]
+    fn join_network_then_error() {
+        let mut s = HttpSignaler::new();
+        let now = Instant::now();
+
+        s.handle(HttpSignalerInput::Request(
+            req(1, Method::POST, "/v1/join/7", "offer-sdp"),
+            now,
+        ))
+        .unwrap();
+        let HttpSignalerOutput::Signal(offer) = s.poll().unwrap() else {
+            panic!("expected offer signal");
+        };
+        let connection_id = offer.connection_id;
+        s.poll(); // timeout request
+
+        s.handle(HttpSignalerInput::Signal(
+            Signal::error(
+                connection_id,
+                crate::signaling::signal::SignalErrorCode::DestinationNotLoggedIn,
+                7,
+            ),
+            now,
+        ))
+        .unwrap();
+
+        let HttpSignalerOutput::Response(resp) = s.poll().unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(resp.addr, 1);
+        assert_eq!(resp.response.status(), StatusCode::FORBIDDEN);
         assert!(s.poll().is_none());
     }
 
@@ -461,94 +398,35 @@ mod tests {
     }
 
     #[test]
-    fn candidates_relay_both_directions() {
+    fn superseded_join_is_failed_with_conflict() {
         let mut s = HttpSignaler::new();
         let now = Instant::now();
 
         s.handle(HttpSignalerInput::Request(
-            req(1, Method::POST, "/v1/join/7", "offer-sdp"),
+            req(1, Method::POST, "/v1/join/7", "offer-sdp-1"),
             now,
         ))
         .unwrap();
+        s.poll(); // offer signal
+        s.poll(); // timeout request
+
+        s.handle(HttpSignalerInput::Request(
+            req(2, Method::POST, "/v1/join/7", "offer-sdp-2"),
+            now,
+        ))
+        .unwrap();
+
+        let HttpSignalerOutput::Response(resp) = s.poll().unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(resp.addr, 1);
+        assert_eq!(resp.response.status(), StatusCode::CONFLICT);
+
         let HttpSignalerOutput::Signal(offer) = s.poll().unwrap() else {
             panic!("expected offer signal");
         };
-        let connection_id = offer.connection_id;
-        s.poll(); // timeout request
-
-        // Client posts its own trickled candidate.
-        s.handle(HttpSignalerInput::Request(
-            req(
-                2,
-                Method::POST,
-                &format!("/v1/candidates/7/{connection_id}"),
-                "client-candidate",
-            ),
-            now,
-        ))
-        .unwrap();
-        let HttpSignalerOutput::Signal(candidate) = s.poll().unwrap() else {
-            panic!("expected candidate signal");
-        };
-        assert_eq!(candidate.signal_type, SignalType::Candidate);
-        assert_eq!(candidate.connection_id, connection_id);
-        assert_eq!(candidate.data, "client-candidate");
-        let HttpSignalerOutput::Response(resp) = s.poll().unwrap() else {
-            panic!("expected response");
-        };
-        assert_eq!(resp.addr, 2);
-        assert_eq!(resp.response.status(), StatusCode::ACCEPTED);
-        assert!(s.poll().is_none());
-
-        // Client long-polls for host candidates; none yet, so it's held open.
-        s.handle(HttpSignalerInput::Request(
-            req(
-                3,
-                Method::GET,
-                &format!("/v1/candidates/7/{connection_id}"),
-                "",
-            ),
-            now,
-        ))
-        .unwrap();
+        assert_eq!(offer.data, "offer-sdp-2");
         assert!(matches!(s.poll(), Some(HttpSignalerOutput::Timeout(_))));
-        assert!(s.poll().is_none());
-
-        // Host trickles a candidate back; the held GET completes immediately.
-        s.handle(HttpSignalerInput::Signal(
-            Signal::candidate(connection_id, "host-candidate".to_string(), 7),
-            now,
-        ))
-        .unwrap();
-        let HttpSignalerOutput::Response(resp) = s.poll().unwrap() else {
-            panic!("expected response");
-        };
-        assert_eq!(resp.addr, 3);
-        assert_eq!(resp.response.status(), StatusCode::OK);
-        assert_eq!(resp.response.body().as_ref(), "host-candidate");
-        assert!(s.poll().is_none());
-
-        // A subsequent poll for the same cursor gets nothing new until timeout.
-        s.handle(HttpSignalerInput::Request(
-            req(
-                4,
-                Method::GET,
-                &format!("/v1/candidates/7/{connection_id}?since=1"),
-                "",
-            ),
-            now,
-        ))
-        .unwrap();
-        assert!(matches!(s.poll(), Some(HttpSignalerOutput::Timeout(_))));
-        assert!(s.poll().is_none());
-
-        s.handle(HttpSignalerInput::Timeout(now + CANDIDATES_POLL_TIMEOUT))
-            .unwrap();
-        let HttpSignalerOutput::Response(resp) = s.poll().unwrap() else {
-            panic!("expected response");
-        };
-        assert_eq!(resp.addr, 4);
-        assert_eq!(resp.response.status(), StatusCode::NO_CONTENT);
         assert!(s.poll().is_none());
     }
 

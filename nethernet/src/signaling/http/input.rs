@@ -6,8 +6,8 @@ use std::time::Instant;
 pub enum HttpSignalerInput {
     /// An HTTP request arrived on the signaling listener.
     Request(HttpSignalerRequest, Instant),
-    /// A signal produced locally (an answer or a trickled candidate) that should be
-    /// relayed back to whichever client is waiting on it.
+    /// A signal produced locally (an answer or a rejection) that should complete
+    /// whichever pending join it answers.
     Signal(Signal, Instant),
     /// A previously requested wakeup (see [`super::output::HttpSignalerOutput::Timeout`])
     /// has elapsed.
