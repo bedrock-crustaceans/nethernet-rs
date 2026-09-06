@@ -12,6 +12,7 @@ use crate::protocol::webrtc::candidate::{format_ice_candidate, parse_ice_candida
 use crate::session::{Channel, Session, SessionOutput};
 use crate::signaling::signal::{Signal, SignalType};
 use bytes::Bytes;
+use rtc::ice::candidate::Candidate;
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -42,23 +43,34 @@ enum SignalKind {
 /// actually moving them across whichever signaler is in use. Everything else
 /// (datagrams, timeouts, application data) is a thin pass-through to the wrapped
 /// [`Session`].
+///
+/// `connect`/`accept` take an already-created [`Session`] and its returned
+/// [`Description`] (from [`Session::new`]) rather than constructing them internally:
+/// attaching an `a=identity` assertion (guide section 5) means signing over the
+/// session's actual certificate fingerprint, which only exists once `Session::new` has
+/// run, so the caller needs a chance to set [`Description::identity`] in between.
 pub struct Connection {
     session: Session,
     connection_id: u64,
     remote_network_id: u64,
+    /// The remote's raw (unverified) `a=identity` value, if any - see
+    /// [`Self::remote_identity`].
+    remote_identity: Option<String>,
 }
 
 impl Connection {
-    /// Starts an outgoing connection attempt (the offerer). Returns the connection and
-    /// the signal(s) to send: always an offer, plus - under [`IceMode::Trickle`] - a
-    /// separate candidate signal.
+    /// Starts an outgoing connection attempt (the offerer) from a session and
+    /// description already created via `Session::new(local_addr, true)` - set
+    /// `description.identity` first if this side needs to assert one (guide section
+    /// 5.1). Returns the connection and the signal(s) to send: always an offer, plus -
+    /// under [`IceMode::Trickle`] - a separate candidate signal.
     pub fn connect(
-        local_addr: SocketAddr,
+        session: Session,
+        description: Description,
         connection_id: u64,
         remote_network_id: u64,
         ice_mode: IceMode,
-    ) -> Result<(Self, Vec<Signal>)> {
-        let (session, description) = Session::new(local_addr, true)?;
+    ) -> (Self, Vec<Signal>) {
         let signals = Self::describe(
             &session,
             &description,
@@ -68,30 +80,49 @@ impl Connection {
             SignalKind::Offer,
         );
 
-        Ok((
+        (
             Self {
                 session,
                 connection_id,
                 remote_network_id,
+                remote_identity: None,
             },
             signals,
-        ))
+        )
     }
 
-    /// Answers an incoming offer (the answerer). Returns the connection and the
+    /// Parses an incoming offer's SDP without any side effects, so the caller can
+    /// inspect it - in particular, validate any `a=identity` assertion it carries
+    /// (guide section 5.1) using its [`Description::fingerprint`] and `.identity` -
+    /// before deciding whether to admit it at all via [`Self::accept`].
+    pub fn parse_offer(offer: &Signal) -> Result<(Description, Vec<Candidate>)> {
+        if offer.signal_type != SignalType::Offer {
+            return Err(ProtocolError::Other("expected an offer signal".to_string()));
+        }
+        Description::parse(&offer.data)
+    }
+
+    /// Answers an incoming offer (the answerer), given a session and description
+    /// already created via `Session::new(local_addr, false)` (set
+    /// `description.identity` first - the guide's section 5.2 requires one on every
+    /// answer, regardless of signaling transport) and the offer's already-parsed
+    /// remote description (see [`Self::parse_offer`] - typically called first to
+    /// validate any identity assertion it carries). Returns the connection and the
     /// signal(s) to send back: always an answer, plus - under [`IceMode::Trickle`] - a
     /// separate candidate signal.
     pub fn accept(
-        local_addr: SocketAddr,
+        mut session: Session,
+        description: Description,
         offer: &Signal,
+        remote_description: Description,
+        remote_candidates: Vec<Candidate>,
         ice_mode: IceMode,
     ) -> Result<(Self, Vec<Signal>)> {
         if offer.signal_type != SignalType::Offer {
             return Err(ProtocolError::Other("expected an offer signal".to_string()));
         }
 
-        let (remote_description, remote_candidates) = Description::parse(&offer.data)?;
-        let (mut session, description) = Session::new(local_addr, false)?;
+        let remote_identity = remote_description.identity.clone();
         session.set_remote_description(&remote_description, remote_candidates)?;
 
         let signals = Self::describe(
@@ -108,6 +139,7 @@ impl Connection {
                 session,
                 connection_id: offer.connection_id,
                 remote_network_id: offer.network_id,
+                remote_identity,
             },
             signals,
         ))
@@ -155,6 +187,7 @@ impl Connection {
         match signal.signal_type {
             SignalType::Answer => {
                 let (description, candidates) = Description::parse(&signal.data)?;
+                self.remote_identity = description.identity.clone();
                 self.session
                     .set_remote_description(&description, candidates)?;
             }
@@ -172,6 +205,19 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    /// The remote's raw, unverified `a=identity` attribute value, once known (from the
+    /// offer, for the answerer; from the answer, for the offerer, once
+    /// [`Self::handle_signal`] has applied it). `None` if the remote didn't send one.
+    ///
+    /// This is not verified by `Connection` itself - use
+    /// [`crate::protocol::webrtc::identity::parse_identity`] and the verification
+    /// functions in that module, checking the signed fingerprints against the remote
+    /// description's `fingerprint` (from whichever of [`Self::parse_offer`] or the
+    /// parsed answer you already have on hand).
+    pub fn remote_identity(&self) -> Option<&str> {
+        self.remote_identity.as_deref()
     }
 
     /// Feeds an inbound datagram received on the local socket.
@@ -211,6 +257,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::webrtc::identity;
     use crate::session::SessionEvent;
     use std::net::Ipv4Addr;
     use std::time::Duration;
@@ -226,14 +273,24 @@ mod tests {
     fn assert_connects(ice_mode: IceMode) {
         let mut now = Instant::now();
 
+        let (offer_session, offer_description) = Session::new(addr(40200), true).unwrap();
         let (mut offerer, offer_signals) =
-            Connection::connect(addr(40200), 42, 7, ice_mode).unwrap();
+            Connection::connect(offer_session, offer_description, 42, 7, ice_mode);
         let mut offer_iter = offer_signals.into_iter();
         let offer = offer_iter.next().unwrap();
         assert_eq!(offer.signal_type, SignalType::Offer);
 
-        let (mut answerer, answer_signals) =
-            Connection::accept(addr(40201), &offer, ice_mode).unwrap();
+        let (remote_description, remote_candidates) = Connection::parse_offer(&offer).unwrap();
+        let (answer_session, answer_description) = Session::new(addr(40201), false).unwrap();
+        let (mut answerer, answer_signals) = Connection::accept(
+            answer_session,
+            answer_description,
+            &offer,
+            remote_description,
+            remote_candidates,
+            ice_mode,
+        )
+        .unwrap();
         let mut answer_iter = answer_signals.into_iter();
         let answer = answer_iter.next().unwrap();
         assert_eq!(answer.signal_type, SignalType::Answer);
@@ -313,9 +370,95 @@ mod tests {
 
     #[test]
     fn signals_for_a_different_connection_are_ignored() {
-        let (mut offerer, _) = Connection::connect(addr(40210), 1, 7, IceMode::Full).unwrap();
+        let (session, description) = Session::new(addr(40210), true).unwrap();
+        let (mut offerer, _) = Connection::connect(session, description, 1, 7, IceMode::Full);
         let unrelated = Signal::answer(999, "irrelevant".to_string(), 7);
         // Wrong connection_id: ignored, not an error.
         offerer.handle_signal(&unrelated).unwrap();
+    }
+
+    fn decode_cpk(claims: &serde_json::Value) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims["cpk"].as_str().unwrap())
+            .unwrap()
+    }
+
+    /// An offerer attaches its own identity assertion, signed over its session's real
+    /// certificate fingerprint; the answerer inspects and verifies it via
+    /// `parse_offer` before deciding to `accept`, then attaches its own in the answer,
+    /// which the offerer in turn verifies once `handle_signal` applies it.
+    #[test]
+    fn identity_assertions_flow_and_verify_in_both_directions() {
+        let (offerer_keypair, _) = identity::generate_keypair().unwrap();
+        let (answerer_keypair, _) = identity::generate_keypair().unwrap();
+
+        let (offer_session, mut offer_description) = Session::new(addr(40220), true).unwrap();
+        let offerer_token =
+            identity::build_server_token(&offerer_keypair, serde_json::Map::new(), None).unwrap();
+        offer_description.identity = Some(
+            identity::build_identity(
+                "offerer.example",
+                &offerer_token,
+                &[offer_description.fingerprint.clone()],
+                &offerer_keypair,
+            )
+            .unwrap(),
+        );
+
+        let (mut offerer, offer_signals) =
+            Connection::connect(offer_session, offer_description, 1, 7, IceMode::Full);
+        let offer = offer_signals.into_iter().next().unwrap();
+
+        // Answerer: pre-validate the offer's identity before accepting at all.
+        let (remote_description, remote_candidates) = Connection::parse_offer(&offer).unwrap();
+        let parsed =
+            identity::parse_identity(remote_description.identity.as_ref().unwrap()).unwrap();
+        assert_eq!(parsed.idp.domain, "offerer.example");
+        let offerer_decoded = identity::verify_self_signed(&parsed.token).unwrap();
+        parsed
+            .verify_fingerprints(
+                &decode_cpk(&offerer_decoded.claims),
+                std::slice::from_ref(&remote_description.fingerprint),
+            )
+            .unwrap();
+
+        let (answer_session, mut answer_description) = Session::new(addr(40221), false).unwrap();
+        let answerer_token =
+            identity::build_server_token(&answerer_keypair, serde_json::Map::new(), None).unwrap();
+        answer_description.identity = Some(
+            identity::build_identity(
+                "answerer.example",
+                &answerer_token,
+                &[answer_description.fingerprint.clone()],
+                &answerer_keypair,
+            )
+            .unwrap(),
+        );
+
+        let (_answerer, answer_signals) = Connection::accept(
+            answer_session,
+            answer_description,
+            &offer,
+            remote_description,
+            remote_candidates,
+            IceMode::Full,
+        )
+        .unwrap();
+        let answer = answer_signals.into_iter().next().unwrap();
+
+        offerer.handle_signal(&answer).unwrap();
+
+        // Offerer: verify the answerer's identity after applying the answer.
+        let (answer_description, _) = Description::parse(&answer.data).unwrap();
+        let parsed = identity::parse_identity(offerer.remote_identity().unwrap()).unwrap();
+        assert_eq!(parsed.idp.domain, "answerer.example");
+        let answerer_decoded = identity::verify_self_signed(&parsed.token).unwrap();
+        parsed
+            .verify_fingerprints(
+                &decode_cpk(&answerer_decoded.claims),
+                &[answer_description.fingerprint],
+            )
+            .unwrap();
     }
 }
