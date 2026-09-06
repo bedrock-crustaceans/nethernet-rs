@@ -3,7 +3,22 @@
 //! receiving the answer SDP back in the response.
 
 use reqwest::{Client, StatusCode};
+use std::sync::Once;
 use url::Url;
+
+/// Installs a default `rustls` crypto provider for `reqwest` (built with its
+/// `rustls-no-provider` feature) to use.
+///
+/// Call this once, before building any [`reqwest::Client`] used with
+/// [`supports_nethernet`]/[`join`] - `reqwest` panics building a `Client` without one,
+/// regardless of whether the request ends up using TLS. Idempotent and cheap to call
+/// more than once (e.g. from every binary entry point that might be first).
+pub fn install_rustls_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// Maximum accepted size of an answer SDP body, guarding against a misbehaving or
 /// malicious endpoint.

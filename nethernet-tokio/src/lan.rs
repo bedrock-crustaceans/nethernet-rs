@@ -10,18 +10,19 @@ use nethernet::signaling::lan::error::LanSignalerError;
 use nethernet::signaling::lan::input::LanSignalerInput;
 use nethernet::signaling::lan::output::LanSignalerOutput;
 use nethernet::signaling::signal::Signal;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 enum Command {
     Signal(Signal),
     SetServerData(Option<ServerData>),
     Discover(SocketAddr),
+    GetDiscovered(oneshot::Sender<HashMap<u64, ServerData>>),
 }
 
 struct Adapter {
@@ -59,6 +60,10 @@ impl UdpDriven for Adapter {
                 if let Ok(data) = discovery::marshal(&RequestPacket, self.network_id) {
                     self.extra_sends.push_back((data, addr));
                 }
+                Ok(())
+            }
+            Command::GetDiscovered(reply) => {
+                let _ = reply.send(self.inner.discovered().clone());
                 Ok(())
             }
         }
@@ -158,6 +163,17 @@ impl LanSignaler {
     /// without waiting for the next broadcast tick.
     pub fn discover(&self, addr: SocketAddr) {
         let _ = self.command_tx.send(Command::Discover(addr));
+    }
+
+    /// Returns a snapshot of every server discovered so far (i.e. that has responded to
+    /// a discovery request with its own server data), keyed by network ID. Returns an
+    /// empty map if the background task has already stopped.
+    pub async fn discovered(&self) -> HashMap<u64, ServerData> {
+        let (tx, rx) = oneshot::channel();
+        if self.command_tx.send(Command::GetDiscovered(tx)).is_err() {
+            return HashMap::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Receives the next signal from a remote peer. Returns `None` once the

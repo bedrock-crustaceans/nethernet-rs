@@ -1,9 +1,9 @@
-use crate::error::Result;
-use crate::protocol::packet::discovery::ServerData;
+//! A builder for the LAN discovery "pong" payload ([`ServerData`]), for values passed
+//! to [`crate::lan::LanSignaler::set_server_data`].
 
-/// Builder for server MOTD/discovery payload (`ServerData`).
-///
-/// This builder is intended for values passed to `Signaling::set_pong_data`.
+use nethernet::protocol::error::Result;
+use nethernet::protocol::packet::discovery::ServerData;
+
 #[derive(Debug, Clone)]
 pub struct NethernetMotd {
     server_data: ServerData,
@@ -85,7 +85,8 @@ impl NethernetMotd {
         self.server_data
     }
 
-    /// Marshals the MOTD payload bytes for `Signaling::set_pong_data`.
+    /// Marshals the MOTD payload bytes, matching the wire format
+    /// [`crate::lan::LanSignaler`] sends over UDP.
     pub fn marshal(self) -> Result<Vec<u8>> {
         self.server_data.marshal()
     }

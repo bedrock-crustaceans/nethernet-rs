@@ -271,6 +271,7 @@ mod tests {
     /// real TCP connection.
     #[tokio::test]
     async fn join_is_answered_end_to_end() {
+        crate::http::client::install_rustls_provider();
         let mut server = HttpSignalingServer::bind(loopback(0)).await.unwrap();
         let base_url = url::Url::parse(&format!("http://{}/", server.local_addr())).unwrap();
 

@@ -1,34 +1,20 @@
-//! Tokio-based NetherNet protocol implementation.
+//! Tokio driver for the sans-io [`nethernet`] crate: async wrappers over its
+//! signaling and connection state machines, driven over real UDP/TCP sockets in
+//! background tasks.
 //!
-//! This crate provides high-level types for creating NetherNet clients and servers using WebRTC:
-//! - [`NethernetStream`] for client connections
-//! - [`NethernetListener`] for server-side connection acceptance
-//! - [`Session`] for WebRTC peer connection management
-//! - [`Signaling`] trait and implementations (LAN discovery)
+//! - [`connection::connect_via_lan`]/[`connection::connect_via_http`] and
+//!   [`listener::Listener`] establish and accept peer connections.
+//! - [`lan::LanSignaler`] and [`http::server::HttpSignalingServer`]/[`http::client`]
+//!   drive the two signaling transports the guide defines.
+//! - [`router::SignalRouter`] fans one signaler's incoming signals out to whichever
+//!   concurrent connection attempt they belong to.
 
-pub mod addr;
-pub mod builders;
 pub mod connection;
-pub mod credentials;
-pub mod error;
 pub mod http;
 pub mod lan;
 pub mod listener;
+pub mod motd;
 mod net;
-pub mod protocol;
 pub mod router;
-pub mod session;
-pub mod signaling;
-pub mod transport;
 
-pub use addr::Addr;
-pub use builders::*;
-pub use credentials::{Credentials, IceServer};
-pub use error::{NethernetError, Result};
-pub use protocol::packet::discovery::{MessagePacket, RequestPacket, ResponsePacket, ServerData};
-pub use protocol::{ConnectError, Message, MessageSegment, Signal, SignalType};
-pub use session::Session;
-pub use signaling::Signaling;
-pub use signaling::http::HttpSignaling;
-pub use signaling::lan::{LanConfig, LanSignaling};
-pub use transport::{ConnectionConfig, NethernetListener, NethernetStream, Timeouts};
+pub use motd::NethernetMotd;

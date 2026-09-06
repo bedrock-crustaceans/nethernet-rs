@@ -272,6 +272,9 @@ fn spawn_late_signal_forwarder(
 ///
 /// `network_id` is this client's own `NetworkID` (see the guide's section 9) - the
 /// value the guide's `POST /v1/join/{networkId}` names, not a remote peer's.
+///
+/// Call [`crate::http::client::install_rustls_provider`] once before building `client`
+/// - `reqwest` panics constructing a `Client` without one.
 pub async fn connect_via_http(
     client: &reqwest::Client,
     base_url: &url::Url,
