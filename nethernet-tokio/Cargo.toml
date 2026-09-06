@@ -23,6 +23,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 url = "2.5.8"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
+http = "1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 [dev-dependencies]
 tracing-subscriber = "0.3.23"
