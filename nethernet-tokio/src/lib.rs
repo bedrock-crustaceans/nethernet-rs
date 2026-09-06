@@ -10,6 +10,7 @@ pub mod addr;
 pub mod builders;
 pub mod credentials;
 pub mod error;
+mod net;
 pub mod protocol;
 pub mod session;
 pub mod signaling;

@@ -1605,6 +1605,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "nethernet",
  "rand 0.10.2",
  "reqwest",
  "rustls",
